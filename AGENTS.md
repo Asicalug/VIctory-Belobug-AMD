@@ -13,7 +13,8 @@ commit and push validated work. Open a PR to `Belobug/VIctory-Belobug-AMD`
 **only after acceptance evidence is met**, then address available review
 comments. No PR is justified now: heavy scenes remain well above 33.3 ms/frame.
 
-Tasks t1–t21 are complete. No further landing-job experiment is pending.
+Earlier tasks t1–t21 are complete. Ordered parallel card-copy merging is now
+retained and validated; native heavy-scene acceptance remains unmet.
 
 ## Exact handoff state
 
@@ -28,27 +29,29 @@ Tasks t1–t21 are complete. No further landing-job experiment is pending.
   not the older, divergent `origin/main`.
 - Last pull of `origin/a-publier`: `Already up to date`; all its commits were
   already integrated.
-- Committed code/evidence baseline before this handoff file: `128cf88`.
-- All committed work through `128cf88` is pushed to the fork.
+- Last committed code/evidence baseline before the copy-back change: `a30e490`.
+- All committed work through `a30e490` is pushed to the fork.
 - The t21 source experiment has been reverted; no t21 source modifications
   remain in `crates/victory-gpu/src/land.rs` or `land/tests.rs`.
 - The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
 - Latest default-release acceptance log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-204114-1604.log`.
-- Latest diagnostics memory-census log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-210714-12456.log`.
-- That default-release run held 30 fps in the opening/menu, but initial 3D was
-  2.7 fps, representative heavy 3D was 5.2 fps/194.1 ms at 4,633 draws, and the
-  heavy transition was 2.0 fps/509.3 ms. Acceptance remains unmet; no PR.
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-215334-22336.log`.
+- Latest diagnostics copy-back A/B log:
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-214230-9640.log`;
+  the memory-census log remains `play-20261127-210714-12456.log`.
+- The default-release run held 30 fps in the opening/menu, but heavy 3D was
+  generally 5–6.6 fps. Final samples were 6.5 fps at 155.0/154.1 ms with about
+  5,000 draws; a heavy transition reached 940.4 ms. Acceptance remains unmet; no PR.
 - It had no panic, device removal, or out-of-memory report. Launcher exit `-1`
   was the intended benchmark timeout killing the title, not a title crash.
-- Representative heavy costs were 61.4 ms preparing, 26.2 ms copies, 79.9 ms on
-  the GPU, and 49.2 ms copying back. It reported `physical_free_mib=3057` and
-  `available_commit_mib=13912`. The 109,104-shape / 3,710.5-MiB cumulative
-  list-making figures belong to earlier diagnostics, principally `201726-9068`,
-  not this release log.
+- Final heavy costs were about 52–53 ms preparing, 21 ms copies, 64–65 ms on
+  the GPU, and 33 ms copying back. Earlier baseline `204114-1604` instead had a
+  61.4 ms preparation / 49.2 ms copy-back representative sample; scenes differ,
+  so do not claim a whole-frame improvement from those two runs. The
+  109,104-shape / 3,710.5-MiB cumulative list-making figures belong to earlier
+  diagnostics, principally `201726-9068`, not either release log.
 - The heap-slot profile and rejected placed-shape hash-table experiment are
   documented in `docs/rx-9070-xt.md`; their temporary source changes were
   reverted. The memory-usage investigation is complete and documented below.
@@ -71,6 +74,25 @@ focus on measured mirror/copy costs, not cheap early exits. The default run also
 spent 49.2 ms copying back in its representative heavy frame. Keep whole-frame
 comparisons matched by scene and draw count. Relay landing remains another
 large, overlapping critical path.
+
+## Copy-back merge decision
+
+Ordered parallel merging of synchronous card copy-back is **retained and on by
+default**. Before the fetch, `land::ordered` sorts by 64 KiB title block,
+coalesces overlapping/touching pieces of one copy, and preserves cross-copy
+order within a block. `land::jobs`/`land::each` then keep aliases of one title
+block in one ordered job. `VICTORY_WIDE_MERGE=0` selects serial merging.
+
+Diagnostics A/B `214230-9640` roughly halved local merge cost: representative
+115–120 MiB batches fell from 35–40 ms to 15–17 ms, and later 85–105 MiB batches
+from 27–29 ms to 14–16 ms. Heavy phases 12→13 (serial→parallel) improved from
+268.7 to 182.3 ms mean and 348.4 to 201.2 ms p90 at 4,380→4,442 draws. This is
+an incremental optimization, not stable-30 evidence. The default release check
+`215334-22336` retained every native-quality setting and still reached only
+5–6.6 fps in heavy 3D with a 940.4 ms transition. Both runs were bounded,
+used no screenshots, and were explicitly cleaned up to zero benchmark processes.
+The complete serial GPU suite passed 399 tests with 35 ignored; diagnostics
+check and both builds passed. Full evidence is in `docs/rx-9070-xt.md`.
 
 ## Memory investigation result
 
@@ -185,9 +207,11 @@ Do **not** run `cargo fmt --all`: the current toolchain reformatted about 142
 otherwise untouched files earlier. Keep diffs scoped, format touched code
 carefully, and use `git diff --check`.
 
-Memory-census validation: its focused book test passed (482 filtered), the
-diagnostics check and `diag` build passed, and the serial GPU library suite again
-passed 399 tests with 35 ignored. `git diff --check` is clean.
+Copy-back validation: diagnostics check and both builds passed; the complete
+serial GPU library suite passed 399 tests with 35 ignored. Existing randomized
+landing-order coverage checks byte coverage, cross-copy block order and job
+boundaries. `git diff --check` is clean. Memory-census validation had the same
+serial-suite result and a passing diagnostics build.
 
 Last committed t20 validation: 399 serial GPU library tests passed, 35 ignored;
 focused crash-record and four residency tests passed. Earlier upstream

@@ -2337,18 +2337,19 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 #[cfg(feature = "diagnostics")]
 static CARD_TIMING: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Card-copy merging on one or several threads: nanoseconds, bytes and pieces
+/// for each, so an A/B also has a local cost when the scene changes.
+#[cfg(feature = "diagnostics")]
+static CARD_MERGE_TIMING: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each. (Not with [`relay`], whose
-/// landings do not come here: `crate::land` has threads of its own.)
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=0` turns it
+/// off; on by default). The pieces the card's compare found differing come
+/// down in one fetch. Title-block ordering above keeps aliases of the same
+/// title memory in one job and in input order; distinct blocks are merged
+/// beside one another. (Not with [`relay`], whose landings do not come here.)
 fn wide_merge() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    crate::toggled!("VICTORY_WIDE_MERGE")
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -5317,6 +5318,32 @@ impl Host {
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
         }
+        // Title blocks, not just (copy, offset), decide what may merge at
+        // the same time: two copies may hold the same title memory. Join
+        // overlapping parts of one copy and put every block's pieces in
+        // their original order, as the relay's landing does. This also
+        // gives the wide merge jobs that never split a title block.
+        if pieces.len() > 1 {
+            let keys: Vec<crate::land::Piece> = pieces
+                .iter()
+                .map(|&(i, lo, hi, _)| {
+                    let shadow = &plan.ranges[i].shadow;
+                    (shadow.id(), shadow.span().0 as usize + lo, hi - lo)
+                })
+                .collect();
+            let mut at = 0;
+            pieces = crate::land::ordered(&keys)
+                .into_iter()
+                .map(|(i, title, len)| {
+                    let range = pieces[i].0;
+                    let lo = title - plan.ranges[range].shadow.span().0 as usize;
+                    let piece = (range, lo, lo + len, at);
+                    at += len as u64;
+                    piece
+                })
+                .collect();
+            total = at;
+        }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
@@ -5360,34 +5387,32 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
-            if wide_merge() && pieces.len() >= 8 {
-                // The pieces are apart from one another (each its own bytes
-                // of its copy and of title memory): several at a time.
+            let wide = wide_merge() && pieces.len() >= 8;
+            #[cfg(feature = "diagnostics")]
+            let merge_began = std::time::Instant::now();
+            if wide {
                 let fetched = *data;
-                let counts: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>> =
-                    std::sync::Arc::new((0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect());
-                let each = pieces.len().div_ceil(8);
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = pieces
-                    .chunks(each)
-                    .map(|chunk| {
-                        let chunk: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> =
-                            chunk.iter().map(|&(i, lo, hi, at)| (plan.ranges[i].shadow.clone(), i, lo, hi, at)).collect();
-                        let counts = counts.clone();
-                        Box::new(move || {
-                            let mut title = Vec::new();
-                            for (shadow, i, lo, hi, at) in chunk {
-                                // SAFETY: the mapping of the fetched bytes;
-                                // the copy into it has run, and the caller
-                                // waits for this job.
-                                let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                                let merged = shadow.card_merge(lo, gpu, &mut title);
-                                shadow.walls_merged(gpu.len(), merged);
-                                counts[i].fetch_add(merged, Ordering::Relaxed);
-                            }
-                        }) as Box<dyn FnOnce() + Send>
-                    })
+                let titles: Vec<(usize, usize)> = pieces
+                    .iter()
+                    .map(|&(i, lo, hi, _)| (plan.ranges[i].shadow.span().0 as usize + lo, hi - lo))
                     .collect();
-                crate::shadow::wide_run(jobs);
+                let jobs = crate::land::jobs(&titles);
+                let counts: Vec<std::sync::atomic::AtomicUsize> =
+                    (0..plan.ranges.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+                crate::land::each(jobs.len(), &|j| {
+                    let mut title = Vec::new();
+                    for &(i, lo, hi, at) in &pieces[jobs[j].clone()] {
+                        let shadow = &plan.ranges[i].shadow;
+                        // SAFETY: the mapping of the fetched bytes; the copy
+                        // into it has run, and `each` waits for every job.
+                        // Jobs do not share a title block, and pieces that do
+                        // share one run here in their original order.
+                        let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
+                        let merged = shadow.card_merge(lo, gpu, &mut title);
+                        shadow.walls_merged(gpu.len(), merged);
+                        counts[i].fetch_add(merged, Ordering::Relaxed);
+                    }
+                });
                 for (written, count) in written.iter_mut().zip(counts.iter()) {
                     *written += count.load(Ordering::Relaxed);
                 }
@@ -5401,6 +5426,13 @@ impl Host {
                     plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
                     written[i] += merged;
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                let at = if wide { 3 } else { 0 };
+                CARD_MERGE_TIMING[at].fetch_add(merge_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                CARD_MERGE_TIMING[at + 1].fetch_add(total, Ordering::Relaxed);
+                CARD_MERGE_TIMING[at + 2].fetch_add(pieces.len() as u64, Ordering::Relaxed);
             }
         }
         for (r, written) in plan.ranges.iter().zip(written) {
@@ -9427,6 +9459,21 @@ impl Meter {
             crate::shadow::exact_line(frames);
             crate::descriptor::sync_line(frames);
             late_line(frames);
+            #[cfg(feature = "diagnostics")]
+            {
+                let m = [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGE_TIMING[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                if m[0] > 0.0 || m[3] > 0.0 {
+                    tracing::info!(
+                        "card-copy merging per frame: one thread {:.2} ms, {:.0} pieces, {:.1} MiB; several threads {:.2} ms, {:.0} pieces, {:.1} MiB (VICTORY_WIDE_MERGE=0 turns it off; A/B can alternate it)",
+                        m[0] / 1e6,
+                        m[2],
+                        m[1] / (1 << 20) as f64,
+                        m[3] / 1e6,
+                        m[5],
+                        m[4] / (1 << 20) as f64,
+                    );
+                }
+            }
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
             upq::line(frames);
