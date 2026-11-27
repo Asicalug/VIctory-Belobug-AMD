@@ -29,9 +29,8 @@ retained and validated; native heavy-scene acceptance remains unmet.
   not the older, divergent `origin/main`.
 - Last pull of `origin/a-publier`: `Already up to date`; all its commits were
   already integrated.
-- Last committed code/evidence baseline before synchronous direct uploads:
-  `efc1b65`.
-- All committed work through `efc1b65` is pushed to the fork.
+- Latest retained code baseline: `17ed48c` (synchronous direct uploads).
+  All committed work through `17ed48c` is pushed to the fork.
 - The t21 source experiment has been reverted; no t21 source modifications
   remain in `crates/victory-gpu/src/land.rs` or `land/tests.rs`.
 - The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
@@ -39,11 +38,13 @@ retained and validated; native heavy-scene acceptance remains unmet.
   the last intended timeout.
 - Latest default-release acceptance log:
   `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-222102-12860.log`.
-- Latest diagnostics direct-upload A/B log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-221132-2864.log`;
-  its preparation profile is `play-20261127-220352-14284.log`. The ordered
-  copy-back A/B remains `play-20261127-214230-9640.log`, and the memory census
-  remains `play-20261127-210714-12456.log`.
+- Latest diagnostics refresh profile:
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-223906-8840.log`;
+  latest rejected sparse-planning A/B: `play-20261127-225604-23816.log`.
+  The direct-upload A/B remains `play-20261127-221132-2864.log`, its preparation
+  profile is `play-20261127-220352-14284.log`, the ordered copy-back A/B remains
+  `play-20261127-214230-9640.log`, and the memory census remains
+  `play-20261127-210714-12456.log`.
 - The default-release run held 30 fps in the opening/menu, but heavy 3D did not
   meet acceptance. Final samples were 7.4/7.2 fps at 135.6/138.4 ms with about
   5,000 draws; a heavy transition reached 1,114.1 ms. No PR is justified.
@@ -122,6 +123,24 @@ Acceptance remains unmet. The runs used no screenshots and were explicitly
 cleaned up to zero processes. Diagnostics check, both builds and all 399 serial
 GPU library tests passed, with 35 ignored. Full evidence is in
 `docs/rx-9070-xt.md`.
+
+## Refresh investigation result
+
+The corrected `223906-8840` profile found roughly 9–20 ms worker-summed no-op
+checking, 58–72 ms worker-summed actual updates and 20–24 ms wall-clock refresh
+time in representative heavy scenes. Only about 190 precheck exits were in-place
+buffers, so a placed-buffer-only prefilter is not a useful target.
+
+A range-covered sparse stale-run planner was tested and **not retained**. Its
+2,000 randomized full-scan equivalence cases and 48 serial watch tests passed,
+but native A/B `225604-23816` showed written entries approximately equal to all
+covered pages (for example 22,358 of 22,358). Local planning differences were
+inconsistent and at most 0.131 ms/frame in the documented representative pairs;
+whole-frame changes had large scene/draw differences. The source experiment and
+counters were removed, leaving `host.rs` and `shadow.rs` at `17ed48c`; the
+rejected diff is archived only under ignored `target/`. Full numbers are in
+`docs/rx-9070-xt.md`. No screenshots were taken and explicit cleanup confirmed
+zero processes. Stable-30 acceptance remains unmet and no PR is justified.
 
 ## Memory investigation result
 
@@ -336,6 +355,11 @@ The rejected t21 experiment left `land.rs` and `land/tests.rs` unchanged.
   invalidation fixes but had **zero native hits**; fully removed.
 - Shared copy-watermark locking is retained as a smaller lock protocol, but its
   A/B did not establish an FPS win. Do not cite it as such.
+- Range-covered sparse stale planning was not sparse in native heavy scenes:
+  written entries approximately equaled scanned pages, and local differences
+  were inconsistent and at most 0.131 ms/frame in the documented pairs. It was
+  removed after A/B `225604-23816`; do not retry without a genuinely sparse
+  profile. See `docs/rx-9070-xt.md`.
 - t21 larger landing jobs did not provide repeatable local or whole-frame
   benefit across two native A/B runs; the experiment was removed. See
   `docs/rx-9070-xt.md` for the paired measurements.
