@@ -106,6 +106,10 @@ name, PCI vendor and device IDs, and dedicated VRAM. Set
 name to select it explicitly. With the launcher, pass
 `-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
 
+For the tested RX 9070 XT / 32 GB RAM configuration, including its compiler
+workarounds, native-1440p command, memory requirements and current limitations,
+see [docs/rx-9070-xt.md](docs/rx-9070-xt.md).
+
 Before the first run, ahead of time (both can be stopped and go on later):
 
 ```powershell

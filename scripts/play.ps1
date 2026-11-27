@@ -3,7 +3,13 @@
 # -Safe         without the newer, faster ways (the first thing to try when something is wrong)
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance)
+# -Rx9070       RX 9070 XT: native 1440p, ray tracing, memory limits, shader workarounds
+# -Performance  renderer ports and 30 fps pacing
+# -Console      series-x (default) or series-s (1080p, less work)
+# -Monitor      one-based display for the initial title window (default: primary)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
+# -BenchmarkSeconds
+#               stop a benchmark after this many seconds, including loading time
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -11,7 +17,13 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
+    [switch]$Rx9070,
+    [switch]$Performance,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [ValidateRange(1, 86400)][int]$BenchmarkSeconds,
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [ValidateRange(1, 16)][int]$Monitor,
+    [string]$Keys,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -26,7 +38,49 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($Rx9070) {
+    # AMD driver 32.0.32029.2010 crashes in amdxc64.dll on translated shaders.
+    # Mask 59 turns off REUSE (bit 4), fixing the three startup compute shaders.
+    # CSComputeSkinningTreeAnimVelocity (f168...) crashes with every optimization
+    # mask, so leave its pipeline out. This can affect skinned animation velocity.
+    # Record late pipelines too, so `victory warm` can test them separately.
+    if (-not $PSBoundParameters.ContainsKey('Console')) { $Console = 'series-x' }
+    $settings.VICTORY_D3D12_ADAPTER = 'Radeon RX 9070'
+    $settings.VICTORY_SHADER_OPT = '59'
+    $settings.VICTORY_SKIP_PIPELINES = 'f16876929fa64f9f'
+    $settings.VICTORY_PIPELINE_BOOK = '1'
+    # Native 2560x1440, not a lower internal image upscaled to 1440p.
+    # The title's own upscaler also avoids shipping FSR4's fixed 1080p tables.
+    $settings.VICTORY_OUTPUT = '2560x1440'
+    $settings.VICTORY_WINDOW_MAX = '2560x1440'
+    $settings.VICTORY_UPSCALER = '6'
+    $settings.VICTORY_RENDER_SCALE = '1.0'
+    $settings.VICTORY_BVH_BUILDER = '1'
+    # Acceptance requires the title's largest mips, including under VRAM pressure.
+    $settings.VICTORY_TEXTURE_MAX = '0'
+    $settings.VICTORY_PIPELINE_WORKERS = '4'
+    $settings.VICTORY_RESIDENCY = '1'
+    # RT arenas are CPU/GPU-shared in place; no unlanded flight may write one
+    # while the next submission is prepared. This also bounds in-flight lists.
+    $settings.VICTORY_LATE_WAIT = '0'
+    # Keep host-side mirrors near their used ranges instead of 4 MiB cells.
+    $settings.VICTORY_WINDOW_KB = '256'
+    $settings.VICTORY_WINDOW_TAILS = '1'
+    $settings.VICTORY_WINDOW_BUDGET_MB = '1024'
+    $settings.VICTORY_RIPE_BLOCKS = '4'
+}
+if ($Performance) {
+    $settings.VICTORY_PORT_CONSTANTS = '1'
+    $settings.VICTORY_PORT_DESCRIPTORS = '1'
+    $settings.VICTORY_PORT_CBV = '1'
+    $settings.VICTORY_PORT_GUARD = '1'
+    $settings.VICTORY_PORT_JOURNAL = '1'
+    # A cap, not an output-size override: native resolution belongs to the preset.
+    $settings.VICTORY_FRAME_INTERVAL_MS = '33.333'
+}
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
+if ($Monitor) { $settings.VICTORY_WINDOW_MONITOR = "$Monitor" }
+if ($Keys) { $settings.VICTORY_KEYS = $Keys }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
@@ -45,4 +99,71 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory run $Exe --execute } finally { Pop-Location }
+$logDir = Join-Path $env:LOCALAPPDATA 'victory\logs'
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+# Windows PowerShell can retain Start-Process redirect handles until it exits.
+# The combined log is complete; clear only our stale, already-copied fragments.
+Get-ChildItem $logDir -Filter 'play-*.log.std*' -ErrorAction SilentlyContinue | Where-Object {
+    $_.LastWriteTime -lt (Get-Date).AddHours(-1)
+} | Remove-Item -Force -ErrorAction SilentlyContinue
+$log = Join-Path $logDir ("play-{0:yyyyMMdd-HHmmss}-{1}.log" -f (Get-Date), $PID)
+Write-Host "Log: $log"
+# Keep the evidence settings even if startup fails. Do not dump all of -More:
+# callers may put unrelated secrets in their environment or wrapper settings.
+$evidenceNames = @(
+    'VICTORY_D3D12_ADAPTER', 'VICTORY_OUTPUT', 'VICTORY_WINDOW_MAX',
+    'VICTORY_RENDER_SCALE', 'VICTORY_UPSCALER', 'VICTORY_FSR_4K',
+    'VICTORY_BVH_BUILDER', 'VICTORY_TEXTURE_MAX', 'VICTORY_SHADER_OPT',
+    'VICTORY_SKIP_PIPELINES', 'VICTORY_LATE_WAIT', 'VICTORY_CARD_BUFFERS_MIN_KB',
+    'VICTORY_CARD_BUFFERS_MIN_MB', 'VICTORY_CARD_BUFFERS_MB',
+    'VICTORY_FRAME_INTERVAL_MS', 'VICTORY_RESIDENCY', 'VICTORY_KEYS',
+    'VICTORY_PORT_CONSTANTS', 'VICTORY_PORT_DESCRIPTORS', 'VICTORY_PORT_CBV',
+    'VICTORY_PORT_GUARD', 'VICTORY_PORT_GUARD_PLAN', 'VICTORY_PORT_JOURNAL',
+    'VICTORY_JOIN_PARTS', 'VICTORY_TITLE_PRIORITIES', 'VICTORY_MAP_THREADS',
+    'VICTORY_LAND_THREADS', 'VICTORY_ASK_SPREAD', 'VICTORY_SYNC_FINE', 'VICTORY_AB'
+)
+$header = @("Build: $Build", "Console: $Console", "BenchmarkSeconds: $BenchmarkSeconds")
+$header += $evidenceNames | ForEach-Object {
+    $value = if ($settings.ContainsKey($_)) { $settings[$_] } else { '<default>' }
+    "Setting $_=$value"
+}
+Set-Content -Path $log -Value $header
+try {
+    if ($BenchmarkSeconds) {
+        # Redirection avoids PowerShell wrapping native diagnostics at the
+        # console width. The timeout includes loading and always reaps the test.
+        $stdout = "$log.stdout"
+        $stderr = "$log.stderr"
+        $arguments = @('run', "`"$Exe`"", '--execute', '--console', $Console)
+        $process = Start-Process -FilePath $victory -ArgumentList $arguments -PassThru `
+            -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        Wait-Process -Id $process.Id -Timeout $BenchmarkSeconds -ErrorAction SilentlyContinue
+        $process.Refresh()
+        if (-not $process.HasExited) {
+            Stop-Process -Id $process.Id -Force
+            Wait-Process -Id $process.Id -ErrorAction SilentlyContinue
+            $status = -1
+        } else {
+            $status = $process.ExitCode
+        }
+        $process.Dispose()
+        foreach ($output in @($stderr, $stdout)) {
+            if (Test-Path $output) {
+                # Explicit streams preserve the native bytes and close promptly;
+                # Get-Content can retain its reader until pipeline cleanup.
+                $reader = [IO.File]::Open($output, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                $writer = [IO.File]::Open($log, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+                try { $reader.CopyTo($writer) } finally { $reader.Dispose(); $writer.Dispose() }
+                Remove-Item $output -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } else {
+        & $victory run $Exe --execute --console $Console 2>&1 | Tee-Object -FilePath $log -Append
+        $status = $LASTEXITCODE
+    }
+} finally {
+    Pop-Location
+}
+Add-Content -Path $log -Value "VIctory exit code: $status"
+Write-Host "VIctory exit code: $status"
+exit $status
