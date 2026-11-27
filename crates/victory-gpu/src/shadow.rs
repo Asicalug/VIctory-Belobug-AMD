@@ -5470,9 +5470,12 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// for the programs that find memory by address, on the card: the structures
 /// rays are traced through, read with every step of every ray.
 ///
-/// What shaders write there by address is not brought back, so the copy is
-/// the only place that has it. The CPU's side holds the bytes as they were
-/// last taken, and only dwords that changed since go up.
+/// Runtime-owned arenas are opened in place where the driver allows it, so
+/// shaders and the CPU use the same bytes. In the fallback copy, shader writes
+/// are not brought back, so that copy is the only place that has them; its CPU
+/// side holds the bytes as they were last taken, and only changed dwords go up.
+/// Small title buffers always use the fallback: their mappings may change,
+/// whereas the runtime's directory and arenas live for the whole process.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
@@ -5488,6 +5491,30 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    // Open the low arena itself as the shaders' buffer. The custom heap is in
+    // PC write-back memory, so the CPU and GPU see the same bytes: neither a
+    // separate staging allocation nor a second shared GPU buffer is needed.
+    // Shaders' writes therefore land in the arena directly, as they do for
+    // other in-place title memory. Late flights may still write an arena when
+    // the CPU prepares the next submission, so they retain the synchronized
+    // copy/merge path. Also fall back when the driver cannot open the region.
+    if len > 64 << 10 && !crate::host::late() {
+        match crate::inplace::place_part(&host.device, start, len) {
+            Ok(placed) => {
+                debug_assert_eq!(placed.bias, 0, "by-address arenas are 64 KiB aligned");
+                tracing::info!(start = format_args!("{start:#x}"), len, "title memory by address: arena in place, no CPU or GPU copy");
+                // `Shadow::placed` takes this off again when the arena goes.
+                crate::inplace::counted(false, len);
+                return Some(Arc::new(Shadow::placed(placed, start, len, false)));
+            }
+            Err(error) => {
+                static FAILED: AtomicU64 = AtomicU64::new(0);
+                if FAILED.fetch_add(1, Ordering::Relaxed) < 4 {
+                    tracing::warn!(start = format_args!("{start:#x}"), len, ?error, "title memory by address: existing heap refused; separate CPU and GPU copies");
+                }
+            }
+        }
+    }
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len).or_else(|| {
