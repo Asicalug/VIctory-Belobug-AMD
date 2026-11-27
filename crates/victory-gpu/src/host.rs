@@ -7956,6 +7956,19 @@ fn split_line(frames: f64) {
         s[2] / 1048576.0,
         s[3],
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let r = [0, 1, 2, 3, 4, 5].map(|i| crate::shadow::SEND_RUNS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "card refresh run finding per frame: scalar {:.2} ms over {:.1} MB into {:.0} runs; direct dword {:.2} ms over {:.1} MB into {:.0} runs",
+            r[0] / 1e6,
+            r[2] / 1048576.0,
+            r[4],
+            r[1] / 1e6,
+            r[3] / 1048576.0,
+            r[5],
+        );
+    }
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
          first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",

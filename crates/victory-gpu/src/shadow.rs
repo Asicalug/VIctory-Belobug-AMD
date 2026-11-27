@@ -2162,6 +2162,11 @@ fn send_changed() -> bool {
 /// held the same, bytes to go up, and the runs they are.
 static SEND: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Diagnostics: nanoseconds, bytes and output runs for scalar (0) and direct
+/// dword (1) run finding in ordinary card refreshes.
+#[cfg(feature = "diagnostics")]
+pub(crate) static SEND_RUNS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
 /// [`SEND`], taken.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn send_stats() -> [u64; 4] {
@@ -2207,6 +2212,13 @@ fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
         return unsafe { word_runs_avx2(title, held) };
     }
     dword_runs(at, title, held, 0)
+}
+
+/// Ordinary card refreshes use [`word_runs`] directly instead of first finding
+/// changed bytes and widening them to the same dwords. `VICTORY_SEND_WORD_RUNS=0`
+/// restores the old route; diagnostics' A/B can alternate it.
+fn send_word_runs() -> bool {
+    crate::toggled!("VICTORY_SEND_WORD_RUNS")
 }
 
 /// # Safety
@@ -2629,7 +2641,7 @@ mod merge_tests {
             seed >> 8
         };
         for round in 0..200 {
-            let n = 4 * (random() as usize % 400);
+            let n = random() as usize % 1600;
             let was: Vec<u8> = (0..n).map(|_| random() as u8).collect();
             let mut now = was.clone();
             for _ in 0..random() % 200 {
@@ -2642,7 +2654,8 @@ mod merge_tests {
                     *b = random() as u8;
                 }
             }
-            assert_eq!(word_runs(0x1000, &now, &was), dword_runs(0x1000, &now, &was, 0), "round {round}");
+            let at = 0x1000 + round % 4;
+            assert_eq!(word_runs(at, &now, &was), dword_runs(at, &now, &was, 0), "round {round}, address {at:#x}");
         }
     }
 
@@ -4355,6 +4368,7 @@ impl Shadow {
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+        let wordwise = send_word_runs();
         let start = self.start as usize;
         TITLE.with_borrow_mut(|title| {
             title.resize(PAGE, 0);
@@ -4370,7 +4384,23 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                #[cfg(feature = "diagnostics")]
+                let finding = std::time::Instant::now();
+                let runs = if whole {
+                    vec![(0, n)]
+                } else if wordwise {
+                    // The unaligned fallback is the original dword_runs call.
+                    word_runs(at, held, title)
+                } else {
+                    dword_runs(at, held, title, 0)
+                };
+                #[cfg(feature = "diagnostics")]
+                if !whole {
+                    let kind = usize::from(wordwise);
+                    SEND_RUNS[kind].fetch_add(finding.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    SEND_RUNS[2 + kind].fetch_add(n as u64, Ordering::Relaxed);
+                    SEND_RUNS[4 + kind].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                }
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
