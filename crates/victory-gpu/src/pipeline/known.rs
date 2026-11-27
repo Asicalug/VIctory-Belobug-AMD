@@ -257,6 +257,21 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
+/// The pipeline key in a `warm-bad.txt` line made for `fingerprint`.
+///
+/// New lines start with the fingerprint, then the key and the reason. Older
+/// lines had no fingerprint, so a crash under one shader mask or driver hid
+/// the pipeline under every other one too. They stay in the file for history,
+/// but are retried once; a real crash is recorded again with its fingerprint.
+pub fn bad_key<'a>(line: &'a str, fingerprint: &str) -> Option<&'a str> {
+    let mut words = line.split_whitespace();
+    let tag = words.next()?;
+    if tag.starts_with('#') || tag != fingerprint {
+        return None;
+    }
+    words.next()
+}
+
 /// The translations of earlier runs are in `dir` (the pipeline library is
 /// not used: what is made here is the driver's to keep).
 pub fn use_translations(dir: PathBuf) {
@@ -467,6 +482,16 @@ impl GraphicsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_records_apply_only_to_their_shader_and_driver_fingerprint() {
+        let key = "0743af219ca9056114e8d5aa6f099523";
+        assert_eq!(bad_key(&format!("driver-a {key} compiler crashed"), "driver-a"), Some(key));
+        assert_eq!(bad_key(&format!("driver-b {key} compiler crashed"), "driver-a"), None);
+        assert_eq!(bad_key(&format!("{key} legacy crash"), "driver-a"), None);
+        assert_eq!(bad_key("# driver-a disabled", "driver-a"), None);
+        assert_eq!(bad_key("driver-a", "driver-a"), None);
+    }
 
     #[test]
     fn failed_open_retries_before_later_records() {

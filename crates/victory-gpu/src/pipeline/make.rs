@@ -103,10 +103,11 @@ impl Pending {
 /// crashes on.
 static SKIPPED_BAD: AtomicU64 = AtomicU64::new(0);
 
-/// The keys of the pipelines the driver's compiler crashed on
-/// (`warm-bad.txt` beside the pipeline library, one key to a line, then
-/// anything; `#` begins a comment), loaded on first use. `VICTORY_WARM_BAD=0`
-/// leaves the file unread.
+/// The keys of the pipelines the driver's compiler crashed on with this
+/// translator, its settings and this driver (`warm-bad.txt` beside the pipeline
+/// library; fingerprint, key, then anything; `#` begins a comment), loaded on
+/// first use. Unfingerprinted legacy lines are retried once, not deleted.
+/// `VICTORY_WARM_BAD=0` leaves the file unread.
 static BAD_KEYS: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
 fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
@@ -115,15 +116,24 @@ fn bad_keys<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R
         if std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0") {
             return Default::default();
         }
+        let fingerprint = super::known::fingerprint();
         let listed = super::library::folder()
             .and_then(|d| std::fs::read_to_string(d.join("warm-bad.txt")).ok())
             .unwrap_or_default();
-        listed
+        let mut ignored = 0;
+        let keys = listed
             .lines()
-            .filter(|l| !l.trim_start().starts_with('#'))
-            .filter_map(|l| l.split_whitespace().next())
-            .map(str::to_owned)
-            .collect()
+            .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
+            .filter_map(|line| {
+                let key = super::known::bad_key(line, &fingerprint);
+                ignored += usize::from(key.is_none());
+                key.map(str::to_owned)
+            })
+            .collect();
+        if ignored != 0 {
+            tracing::info!(ignored, fingerprint, "compiler-crash records for other shader or driver settings ignored");
+        }
+        keys
     });
     f(keys)
 }
@@ -298,7 +308,13 @@ fn lost(slot: usize) {
         use std::io::Write;
         let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("warm-bad.txt"));
         if let Ok(mut f) = file {
-            let _ = writeln!(f, "{} ended the compiler in a run: {:?}", p.key, p.shaders);
+            let _ = writeln!(
+                f,
+                "{} {} ended the compiler in a run: {:?}",
+                super::known::fingerprint(),
+                p.key,
+                p.shaders
+            );
         }
     }
     let _ = p.made.set(None);
@@ -413,6 +429,11 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    // A skipped shader can crash the host compiler, not only render wrongly.
+    // Do not queue it in the background before its first draw can be skipped.
+    if super::has_skipped_shader(&p.shaders) {
+        return;
+    }
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
