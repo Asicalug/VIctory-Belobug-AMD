@@ -35,6 +35,8 @@ mod writer;
 
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
+/// Compiler crashes and hangs recorded by `victory warm` and the runtime guard.
+pub const WARM_BAD_FILE: &str = "warm-bad.txt";
 /// Stages by their number in the files.
 const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
@@ -257,19 +259,64 @@ pub fn fingerprint() -> String {
     h.finalize().to_hex()[..16].to_owned()
 }
 
-/// The pipeline key in a `warm-bad.txt` line made for `fingerprint`.
-///
-/// New lines start with the fingerprint, then the key and the reason. Older
-/// lines had no fingerprint, so a crash under one shader mask or driver hid
-/// the pipeline under every other one too. They stay in the file for history,
-/// but are retried once; a real crash is recorded again with its fingerprint.
-pub fn bad_key<'a>(line: &'a str, fingerprint: &str) -> Option<&'a str> {
-    let mut words = line.split_whitespace();
-    let tag = words.next()?;
-    if tag.starts_with('#') || tag != fingerprint {
-        return None;
+/// Whether `warm-bad.txt` is ignored (`VICTORY_WARM_BAD=0`).
+pub fn bad_list_disabled() -> bool {
+    std::env::var_os("VICTORY_WARM_BAD").is_some_and(|v| v == "0")
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Formats a `warm-bad.txt` entry with the pipeline key in column one (so
+/// older binaries still quarantine the key) and a tagged fingerprint so
+/// driver or translator updates retry it automatically.
+pub fn format_bad_entry(key: &str, fingerprint: &str, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("{key} fp={fingerprint}")
+    } else {
+        format!("{key} fp={fingerprint} {reason}")
     }
-    words.next()
+}
+
+/// Pipeline keys from `warm-bad.txt` that apply to `fingerprint`.
+///
+/// Blank lines and `#` comments are ignored. Entries tagged with a
+/// fingerprint (`<key> fp=<16-hex-fingerprint> ...`, or
+/// `<16-hex-fingerprint> <32-hex-key> ...`) apply only when their
+/// fingerprint matches `fingerprint`, so a driver or translator update
+/// automatically retries them. Legacy or manually added bare-key lines
+/// (`<key> ...`) continue to apply regardless of fingerprint.
+pub fn parse_bad_keys(text: &str, fingerprint: &str) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        if let Some(second) = parts.next() {
+            if let Some(fp) = second.strip_prefix("fp=")
+                && is_hex(fp, 16)
+            {
+                if fp == fingerprint {
+                    keys.insert(first.to_owned());
+                }
+                continue;
+            }
+            if is_hex(first, 16) && is_hex(second, 32) {
+                if first == fingerprint {
+                    keys.insert(second.to_owned());
+                }
+                continue;
+            }
+        }
+        keys.insert(first.to_owned());
+    }
+    keys
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is
@@ -486,11 +533,12 @@ mod tests {
     #[test]
     fn crash_records_apply_only_to_their_shader_and_driver_fingerprint() {
         let key = "0743af219ca9056114e8d5aa6f099523";
-        assert_eq!(bad_key(&format!("driver-a {key} compiler crashed"), "driver-a"), Some(key));
-        assert_eq!(bad_key(&format!("driver-b {key} compiler crashed"), "driver-a"), None);
-        assert_eq!(bad_key(&format!("{key} legacy crash"), "driver-a"), None);
-        assert_eq!(bad_key("# driver-a disabled", "driver-a"), None);
-        assert_eq!(bad_key("driver-a", "driver-a"), None);
+        let current = format_bad_entry(key, "aaaabbbbccccdddd", "compiler crashed");
+        let other = format_bad_entry(key, "ddddeeeeffff0000", "compiler crashed");
+        let text = format!("{current}\n{other}\n# {key} disabled");
+        assert_eq!(parse_bad_keys(&text, "aaaabbbbccccdddd"), HashSet::from([key.to_owned()]));
+        assert_eq!(parse_bad_keys(&text, "1111222233334444"), HashSet::new());
+        assert_eq!(parse_bad_keys(&format!("{key} legacy crash"), "aaaabbbbccccdddd"), HashSet::from([key.to_owned()]));
     }
 
     #[test]
@@ -595,5 +643,69 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bad_keys_expire_with_fingerprint_and_skip_comments() {
+        let k_stale = "a".repeat(32);
+        let k_warm = "b".repeat(32);
+        let k_no_reason = "c".repeat(32);
+        let k_tab = "d".repeat(32);
+        let k_fp_first = "e".repeat(32);
+        let k_legacy = "f".repeat(32);
+        let k_bare = "1".repeat(32);
+        let k_bad_tag = "2".repeat(32);
+
+        let warm_line = format_bad_entry(&k_warm, "8899aabbccddeeff", "hung for 180 s");
+        assert_eq!(warm_line.split(' ').next(), Some(k_warm.as_str()));
+        let stale_line = format_bad_entry(&k_stale, "0011223344556677", "exit code: 0xc0000005");
+        let no_reason_line = format_bad_entry(&k_no_reason, "8899aabbccddeeff", "");
+        assert_eq!(no_reason_line, format!("{k_no_reason} fp=8899aabbccddeeff"));
+
+        let text = format!(
+            "\n   \n# comment\n   # indented comment\n\
+             {stale_line}\n\
+             {warm_line}\n\
+             {no_reason_line}\n\
+             \t{k_tab}\tfp=8899aabbccddeeff\tended the compiler\n\
+             8899aabbccddeeff {k_fp_first} legacy fp-first\n\
+             {k_legacy} legacy crash\n\
+             {k_bare}\n\
+             manual-skip-key reason\n\
+             {k_bad_tag} fp=nothex reason\n"
+        );
+
+        assert_eq!(
+            parse_bad_keys(&text, "8899aabbccddeeff"),
+            HashSet::from([
+                k_warm,
+                k_no_reason,
+                k_tab,
+                k_fp_first,
+                k_legacy.clone(),
+                k_bare.clone(),
+                "manual-skip-key".to_owned(),
+                k_bad_tag.clone(),
+            ])
+        );
+        assert_eq!(
+            parse_bad_keys(&text, "0011223344556677"),
+            HashSet::from([
+                k_stale,
+                k_legacy.clone(),
+                k_bare.clone(),
+                "manual-skip-key".to_owned(),
+                k_bad_tag.clone(),
+            ])
+        );
+        assert_eq!(
+            parse_bad_keys(&text, "ffffffffffffffff"),
+            HashSet::from([
+                k_legacy,
+                k_bare,
+                "manual-skip-key".to_owned(),
+                k_bad_tag,
+            ])
+        );
     }
 }
