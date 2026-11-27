@@ -36,9 +36,13 @@ Tasks t1–t21 are complete. No further landing-job experiment is pending.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
 - Latest native log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-194955-20680.log`.
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-203020-22940.log`.
 - That run had no panic, device removal, or out-of-memory report. Launcher exit
   `-1` was the intended benchmark timeout killing the title, not a title crash.
+- The heap-slot profile and rejected placed-shape hash-table experiment are
+  documented in `docs/rx-9070-xt.md`; their temporary source changes were
+  reverted. A memory-usage investigation is pending, but the cumulative
+  private-byte-growth counter is not proof of a leak.
 
 ## Completed t21 decision
 
@@ -50,9 +54,11 @@ and their paired heavy-phase measurements are recorded in
 source diffs were reverted; the default remains 256 KiB and no experiment switch
 or temporary test remains.
 
-Before choosing another optimization, profile relay landing and heap-view
-critical paths again. Earlier heavy samples put roughly 31 ms in relay landing
-and 20.8 ms in the heap-slot walk, but these overlap other worker costs.
+Before choosing another optimization, review the new heap-slot profile in
+`docs/rx-9070-xt.md`. Roughly 11,000–17,000 buffer copies per heavy frame
+remain after table-owned slots exit; focus on measured mirror/copy costs, not
+the cheap early exits. Keep whole-frame comparisons matched by scene and draw
+count. Relay landing remains another large, overlapping critical path.
 
 ## How the repository works
 
@@ -241,6 +247,9 @@ The rejected t21 experiment left `land.rs` and `land/tests.rs` unchanged.
 - t21 larger landing jobs did not provide repeatable local or whole-frame
   benefit across two native A/B runs; the experiment was removed. See
   `docs/rx-9070-xt.md` for the paired measurements.
+- A hash index for placed-view shapes passed descriptor tests but did not
+  reproduce its apparent local or whole-frame benefit in a second native run;
+  it was removed. Do not cite the first, lighter-scene candidate as a win.
 
 ## General optimization and benchmark discipline
 
