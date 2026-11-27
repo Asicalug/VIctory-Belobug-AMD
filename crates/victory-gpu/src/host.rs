@@ -566,6 +566,15 @@ fn sweep() {
     crate::resource::let_go_idle();
 }
 
+/// Retired objects still waiting for submissions (the memory census).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn retired_waiting() -> usize {
+    RETIRED
+        .iter()
+        .map(|part| part.lock().unwrap_or_else(|e| e.into_inner()).len())
+        .sum()
+}
+
 /// The number of the newest submission begun, and of the newest of which all
 /// before it have finished too.
 pub(crate) fn submissions() -> (u64, u64) {

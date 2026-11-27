@@ -35,20 +35,23 @@ Tasks t1–t21 are complete. No further landing-job experiment is pending.
 - The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
-- Latest native log:
+- Latest default-release acceptance log:
   `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-204114-1604.log`.
+- Latest diagnostics memory-census log:
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-210714-12456.log`.
 - That default-release run held 30 fps in the opening/menu, but initial 3D was
   2.7 fps, representative heavy 3D was 5.2 fps/194.1 ms at 4,633 draws, and the
   heavy transition was 2.0 fps/509.3 ms. Acceptance remains unmet; no PR.
 - It had no panic, device removal, or out-of-memory report. Launcher exit `-1`
   was the intended benchmark timeout killing the title, not a title crash.
 - Representative heavy costs were 61.4 ms preparing, 26.2 ms copies, 79.9 ms on
-  the GPU, and 49.2 ms copying back. The run also logged 109,104 view shapes
-  and 3,710.5 MiB cumulative private allocation growth while making lists;
-  these are ownership/lifetime leads, not proof of a leak.
+  the GPU, and 49.2 ms copying back. It reported `physical_free_mib=3057` and
+  `available_commit_mib=13912`. The 109,104-shape / 3,710.5-MiB cumulative
+  list-making figures belong to earlier diagnostics, principally `201726-9068`,
+  not this release log.
 - The heap-slot profile and rejected placed-shape hash-table experiment are
   documented in `docs/rx-9070-xt.md`; their temporary source changes were
-  reverted. A memory-usage investigation is pending.
+  reverted. The memory-usage investigation is complete and documented below.
 
 ## Completed t21 decision
 
@@ -60,14 +63,36 @@ and their paired heavy-phase measurements are recorded in
 source diffs were reverted; the default remains 256 KiB and no experiment switch
 or temporary test remains.
 
-Before choosing another optimization, quantify current private bytes, working
-set, allocation ownership, and lifetime for the reported memory growth. Then
-choose one measured 3D hotspot. The preceding heap profile left roughly
+Memory ownership and lifetime have now been quantified as described below;
+no permanent multi-GiB leak or safe early-free rule was validated. Next, choose
+one measured 3D hotspot. The preceding heap profile left roughly
 11,000–17,000 buffer copies per heavy frame after table-owned slots exited;
 focus on measured mirror/copy costs, not cheap early exits. The default run also
 spent 49.2 ms copying back in its representative heavy frame. Keep whole-frame
 comparisons matched by scene and draw count. Relay landing remains another
 large, overlapping critical path.
+
+## Memory investigation result
+
+- Bounded native-quality runs `205058-8096` (diagnostics address map),
+  `210009-8636` (ordinary release), and `210714-12456` (resource census) used no
+  screenshots and were cleaned up afterward. Release private bytes reached about
+  28.3 GB, then fell/fluctuated rather than growing monotonically; working set
+  also fell late in the run. This validates extreme ownership, not a monotonic
+  leak over the bounded window.
+- The final census has 45,472 live book entries / 22,721 MiB including overlaps,
+  62,798 gone entries, and 2,003 resources awaiting retirement. Big owners are
+  title memory (5,740 MiB), title buffers (1,897 MiB), texture-pool blocks
+  (5,888 MiB), placed textures (1,105 MiB), and runtime buffers (2,302 MiB).
+  Pool blocks contain placed textures, so these are not unique physical-memory
+  amounts. Carded mirrors can own both CPU staging and GPU-side copies.
+- The 84,765 placed descriptor shapes in the diagnostics map run account for only
+  about 32 MiB of descriptor/view storage. Cumulative list-making growth is not
+  live storage. Retirement backlog reaches 56,605 objects and later falls to
+  2,003. No specific permanent multi-GiB leak or safe early-free rule was
+  validated. The resource-book census and `retired_waiting` are diagnostics-only
+  census aids; do not trade away fences, live title mirrors, shader-write ordering,
+  partial ranges, or guarded views to lower these totals.
 
 ## How the repository works
 
@@ -159,6 +184,10 @@ git diff --check && cargo test --locked -p victory-gpu pipeline::known::tests::c
 Do **not** run `cargo fmt --all`: the current toolchain reformatted about 142
 otherwise untouched files earlier. Keep diffs scoped, format touched code
 carefully, and use `git diff --check`.
+
+Memory-census validation: its focused book test passed (482 filtered), the
+diagnostics check and `diag` build passed, and the serial GPU library suite again
+passed 399 tests with 35 ignored. `git diff --check` is clean.
 
 Last committed t20 validation: 399 serial GPU library tests passed, 35 ignored;
 focused crash-record and four residency tests passed. Earlier upstream

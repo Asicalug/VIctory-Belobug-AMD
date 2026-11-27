@@ -1018,6 +1018,7 @@ fn log_memory() {
         mb(crate::shadow::window_cover()),
         lists[3],
     );
+    crate::book::memory();
     if memory_categories() {
         let fields: &[(&str, u64)] = &[
             ("working set", working),

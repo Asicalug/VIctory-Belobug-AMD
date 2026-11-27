@@ -413,6 +413,47 @@ pub(crate) fn root(gpu: u64, bytes: u64) {
     }
 }
 
+fn group_name(what: &str) -> &str {
+    what.split_once(" 0x").map_or(what, |(name, _)| name)
+}
+
+/// Live host resources by their names, beside the bounded history of ones
+/// already gone. Names up to an address are grouped so individual title
+/// buffers do not each make a line. Bytes may overlap: a texture pool's block
+/// and a texture placed in it are both in the book.
+pub(crate) fn memory() {
+    if !on() {
+        return;
+    }
+    let retired = crate::host::retired_waiting();
+    let (live, gone, unknown, bytes, mut groups) = with(|b| {
+        let mut groups: HashMap<String, (u64, u64)> = HashMap::new();
+        for e in b.live.values() {
+            let group = groups.entry(group_name(&e.what).to_owned()).or_default();
+            group.0 += 1;
+            group.1 += e.size;
+        }
+        (
+            b.live.len(),
+            b.gone.len(),
+            b.unknown.values().sum::<u64>(),
+            b.live.values().map(|e| e.size).sum::<u64>(),
+            groups.into_iter().collect::<Vec<_>>(),
+        )
+    });
+    groups.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+    let groups: Vec<String> = groups
+        .into_iter()
+        .take(16)
+        .map(|(name, (count, bytes))| format!("{name}: {count}, {} MB", bytes >> 20))
+        .collect();
+    let total_mb = bytes >> 20;
+    tracing::info!(
+        "memory, host resource book: {live} live, {total_mb} MB in all (may overlap), {gone} gone kept (at most {GONE}), {unknown} without an address, {retired} waiting to be dropped; biggest live groups: {}",
+        groups.join("; ")
+    );
+}
+
 /// What a descriptor's 32 bytes name.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Names {
@@ -727,6 +768,12 @@ mod tests {
             }
         }
         FORCED.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn memory_groups_leave_out_resource_addresses() {
+        assert_eq!(group_name("title memory 0x1234+0x4000"), "title memory");
+        assert_eq!(group_name("a shared buffer"), "a shared buffer");
     }
 
     #[test]
