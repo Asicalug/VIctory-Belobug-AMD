@@ -36,13 +36,19 @@ Tasks t1–t21 are complete. No further landing-job experiment is pending.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
 - Latest native log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-203020-22940.log`.
-- That run had no panic, device removal, or out-of-memory report. Launcher exit
-  `-1` was the intended benchmark timeout killing the title, not a title crash.
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-204114-1604.log`.
+- That default-release run held 30 fps in the opening/menu, but initial 3D was
+  2.7 fps, representative heavy 3D was 5.2 fps/194.1 ms at 4,633 draws, and the
+  heavy transition was 2.0 fps/509.3 ms. Acceptance remains unmet; no PR.
+- It had no panic, device removal, or out-of-memory report. Launcher exit `-1`
+  was the intended benchmark timeout killing the title, not a title crash.
+- Representative heavy costs were 61.4 ms preparing, 26.2 ms copies, 79.9 ms on
+  the GPU, and 49.2 ms copying back. The run also logged 109,104 view shapes
+  and 3,710.5 MiB cumulative private allocation growth while making lists;
+  these are ownership/lifetime leads, not proof of a leak.
 - The heap-slot profile and rejected placed-shape hash-table experiment are
   documented in `docs/rx-9070-xt.md`; their temporary source changes were
-  reverted. A memory-usage investigation is pending, but the cumulative
-  private-byte-growth counter is not proof of a leak.
+  reverted. A memory-usage investigation is pending.
 
 ## Completed t21 decision
 
@@ -54,11 +60,14 @@ and their paired heavy-phase measurements are recorded in
 source diffs were reverted; the default remains 256 KiB and no experiment switch
 or temporary test remains.
 
-Before choosing another optimization, review the new heap-slot profile in
-`docs/rx-9070-xt.md`. Roughly 11,000–17,000 buffer copies per heavy frame
-remain after table-owned slots exit; focus on measured mirror/copy costs, not
-the cheap early exits. Keep whole-frame comparisons matched by scene and draw
-count. Relay landing remains another large, overlapping critical path.
+Before choosing another optimization, quantify current private bytes, working
+set, allocation ownership, and lifetime for the reported memory growth. Then
+choose one measured 3D hotspot. The preceding heap profile left roughly
+11,000–17,000 buffer copies per heavy frame after table-owned slots exited;
+focus on measured mirror/copy costs, not cheap early exits. The default run also
+spent 49.2 ms copying back in its representative heavy frame. Keep whole-frame
+comparisons matched by scene and draw count. Relay landing remains another
+large, overlapping critical path.
 
 ## How the repository works
 
