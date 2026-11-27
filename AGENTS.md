@@ -1,0 +1,298 @@
+# Agent handoff: RX 9070 XT native-1440p RT
+
+## Current objective and acceptance
+
+Work toward repeatable, stable **30 fps or better at native 2560×1440** with the
+title's ray-traced indirect lighting. Do not reduce texture size/mips, render
+scale, native input resolution, RT, or other visual settings to get there.
+Preserve shader-write/title-write ordering, guarded-view behavior, crash-page
+handling, landing semantics, and no-lost-write coverage.
+
+Use bounded, repeatable opening/heavy-scene/transition benchmarks. Review, test,
+commit and push validated work. Open a PR to `Belobug/VIctory-Belobug-AMD`
+**only after acceptance evidence is met**, then address available review
+comments. No PR is justified now: heavy scenes remain well above 33.3 ms/frame.
+
+The active goal is `happy.quail`. Tasks t1–t20 are complete; t21 is in progress.
+
+## Exact handoff state
+
+- Repository: `C:\Users\FlowUp\VIctory-Belobug-AMD`.
+- Always set this as the tool working directory. The default tool directory can
+  be the unrelated `C:\Users\FlowUp\VIctory-7900XTX`; do not modify that tree.
+- Branch: `amd-rx9070-native30`, tracking `fork/amd-rx9070-native30`.
+- Remotes:
+  - `origin`: `https://github.com/Belobug/VIctory-Belobug-AMD.git`.
+  - `fork`: `https://github.com/Asicalug/VIctory-Belobug-AMD.git`.
+- Integration branch: `origin/a-publier` (the original repository's default),
+  not the older, divergent `origin/main`.
+- Last pull of `origin/a-publier`: `Already up to date`; all its commits were
+  already integrated.
+- Committed code/evidence baseline before this handoff file: `128cf88`.
+- All committed work through `128cf88` is pushed to the fork.
+- The t21 experiment is deliberately **uncommitted** in:
+  - `crates/victory-gpu/src/land.rs`
+  - `crates/victory-gpu/src/land/tests.rs`
+- `AGENTS.md` is the only handoff documentation addition. Do not restore the two
+  t21 source files when resuming; their diff is the pending experiment.
+- No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
+  the last intended timeout.
+- Latest native log:
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-165120-15104.log`.
+- That run had no panic, device removal, or out-of-memory report. Launcher exit
+  `-1` was the intended benchmark timeout killing the title, not a title crash.
+
+## Resume t21 here
+
+Hypothesis: increasing landing jobs from 256 KiB to 512 KiB could reduce the
+number of per-job guard-note flushes. The latest earlier heavy sample had about
+503 jobs/frame and 6.14 ms of guard opening/noting across landing threads. Jobs
+must still never split a 64 KiB title block or change piece order/merge bytes.
+
+Current uncommitted implementation:
+
+- Adds `land::job_bytes()`; default remains 256 KiB.
+- Diagnostics A/B switch `VICTORY_LAND_JOB_512` selects 512 KiB only in its on
+  phases.
+- Splits the existing job construction into `jobs_with(pieces, target)` so tests
+  can check explicit targets.
+- Adds `job_targets_preserve_pieces_and_whole_blocks`, covering exact targets,
+  complete piece coverage, block boundaries, a block larger than its target, and
+  empty input.
+
+Validation already completed for this exact experiment:
+
+- `cargo test --locked -p victory-gpu land::tests -- --test-threads=1`:
+  **8 passed, 0 failed, 1 ignored**.
+- `cargo check --locked -p victory-gpu --features diagnostics`: passed.
+- `git diff --check`: passed before the native run.
+- The last complete serial suite was before t21: **399 passed, 35 ignored**.
+  Rerun it after the retention decision; the new test should add one test.
+
+Native `play-20261127-165120-15104.log` alternated every 12 seconds. Selected
+completed phases:
+
+| Phase | Job target | Mean / median ms | Draws/frame | Fetched-merge ms | Jobs/frame | Guard-note ms |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 9 | 512 KiB | 86.2 / 62.6 | 1,902 | 13.84 | 441 | 5.68 |
+| 10 | 256 KiB | 105.5 / 77.4 | 1,906 | 14.17 | 479 | 4.30 |
+| 11 | 512 KiB | 97.3 / 66.0 | 4,706 | 15.89 | 499 | 5.47 |
+| 12 | 256 KiB | 117.9 / 76.0 | 4,945 | 13.22 | 458 | 4.91 |
+
+Whole-frame results look favorable in these pairs, but this is **not yet causal
+evidence**: scene work, fetched work, job counts and guard-note time vary, and
+the intended local note-time reduction did not occur. Job counts did not halve.
+Phases 7/8 had much larger draw-count differences (1,049 versus 1,577), so do
+not use them as a matched pair.
+
+Next action: analyze/repeat the existing A/B in stable heavy phases; compare
+local landing and guard-note costs as well as frame time. Retain and change the
+default only with repeatable local/whole-frame benefit. Otherwise revert only
+the two t21 source diffs and record the rejected result. Do not start another
+long benchmark before reviewing this log.
+
+Repeat command, when needed:
+
+```bash
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& 'C:\Users\FlowUp\VIctory-Belobug-AMD\scripts\play.ps1' -Exe 'C:\Users\FlowUp\Downloads\GTA6\game_scarlett_master.exe' -Rx9070 -Performance -Build diag -BenchmarkSeconds 180 -Keys '20:Enter,40:Enter,60:Enter,80:Enter,100:Enter,120:Enter' -More @{ VICTORY_LATE_WAIT = '3'; VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_AB = '12,VICTORY_LAND_JOB_512' }"
+```
+
+After t21, profile relay landing and heap-view critical paths again before
+choosing another optimization. Earlier heavy samples put roughly 31 ms in relay
+landing and 20.8 ms in the heap-slot walk, but these overlap other worker costs.
+
+## How the repository works
+
+This is a Rust 2024 Windows/D3D12 compatibility layer for a user-supplied Xbox
+Series title. It ports/patches renderer behavior where possible rather than
+emulating every console operation. Rust 1.88 is the workspace minimum; the
+repository pins the actual toolchain. Game files/assets are not in this repo.
+
+### Workspace map
+
+- `apps/victory`: `victory` CLI (`run`, shader translation, `warm`, diagnostics).
+- `crates/victory-loader`, `victory-pe`: PE/image loading and title mapping.
+- `crates/victory-hle`: high-level Xbox/runtime services, including lifecycle,
+  input, COM and module behavior.
+- `crates/victory-gpu`: D3D12 runtime, descriptor heaps, memory tracking,
+  submission preparation, uploads, residency, copy-back and landing.
+- `crates/victory-shader`, `victory-pipeline`: shader translation and pipeline
+  creation/cache/warm-up support.
+- `crates/victory-formats`, `victory-core`, `victory-game`: shared formats,
+  core utilities and game-facing support.
+- `scripts/play.ps1`: supported launcher and bounded benchmark harness.
+- `docs/rx-9070-xt.md`: detailed native-RT settings, measurements, validation,
+  and rejected experiments. Keep it updated with performance decisions.
+
+### Frame/data flow
+
+1. Loader/HLE services run the title and intercept its renderer/runtime calls.
+2. Thin-list recording translates title command-list calls on worker threads.
+3. `draw.rs` and `host.rs` prepare submissions and descriptor tables.
+4. Descriptor code mirrors title views into host heaps. The heap-view pass also
+   prepares buffers selected by computed shader indices.
+5. Most title buffers cannot simply be read by the host GPU. `shadow.rs` keeps
+   host copies, often with a CPU staging side plus a card-local side. Dirty
+   ranges are refreshed and uploaded before draws.
+6. `watch.rs` uses write watching and read-only guards to find title writes.
+   Its journal tracks asking/write numbers; landing notes must remain visible
+   to later refreshes. Watch pages are 64 KiB; kernel pages are 4 KiB.
+7. Card-local copies are hashed/compared after submissions. Changed pieces are
+   fetched and merged by `land.rs`/`safecopy.rs` on several workers.
+8. The merge stores only shader-changed dwords without overwriting newer title
+   bytes. `land.rs` orders pieces by 64 KiB title block, groups them into jobs,
+   writes beside guards where possible, then flushes watch notes.
+9. Relay completion updates title memory before read-backs/fence signals let the
+   title continue. `residency.rs` and texture queues manage VRAM/RAM pressure.
+
+Useful invariants:
+
+- Pieces of one title 64 KiB block stay in one landing job and in input order.
+- A landing completes before the title is told its flights completed.
+- A refresh must observe both ordinary title writes and shader-landing notes.
+- A copy watermark update excludes readers; unchanged checks may read shared.
+- Only declared/known ranges are refreshed where the implementation documents
+  that shortcut; do not broaden stale-data shortcuts for performance.
+- Partial pages/ranges and guarded views are correctness-critical, not optional
+  fast-path special cases.
+
+### Builds and profiles
+
+Workspace release uses thin LTO and one codegen unit. `diag` inherits release
+optimization but disables LTO, uses 16 codegen units, and enables separate build
+output so it does not evict plain release artifacts.
+
+```bash
+cargo build --locked --release -p victory
+cargo build --locked --profile diag -p victory --features diagnostics
+cargo check --locked -p victory-gpu --features diagnostics
+```
+
+`-Build diag` in the launcher requests light DRED. Run the launcher normally,
+not elevated, so the driver uses the expected shader cache.
+
+### Tests and formatting
+
+GPU/watch tests share global state. Run them serially:
+
+```bash
+cargo test --locked -p victory-gpu --lib -- --test-threads=1
+cargo test --locked -p victory-gpu refresh_tests -- --test-threads=1
+cargo test --locked -p victory-gpu watch::port7_tests -- --test-threads=1
+cargo test --locked -p victory-gpu land::tests -- --test-threads=1
+```
+
+Goal verification command:
+
+```bash
+git diff --check && cargo test --locked -p victory-gpu pipeline::known::tests::crash_records_apply_only_to_their_shader_and_driver_fingerprint && cargo test --locked -p victory-gpu residency::tests
+```
+
+Do **not** run `cargo fmt --all`: the current toolchain reformatted about 142
+otherwise untouched files earlier. Keep diffs scoped, format touched code
+carefully, and use `git diff --check`.
+
+Last committed t20 validation: 399 serial GPU library tests passed, 35 ignored;
+focused crash-record and four residency tests passed. Earlier upstream
+integration also passed HLE/app suites; see `docs/rx-9070-xt.md` for exact
+counts. Default parallel test order has exposed pre-existing shared-state
+failures before; only serial results are claimed here.
+
+## Native RX 9070 XT benchmark contract
+
+Test machine: RX 9070 XT, Ryzen 7 9700X, 32 GB RAM, AMD driver
+`32.0.32029.2010`.
+
+The `-Rx9070` launcher preset selects:
+
+- Native `VICTORY_OUTPUT=2560x1440`, window cap 2560×1440.
+- `VICTORY_RENDER_SCALE=1.0`, title upscaler setting 6, title BVH builder on.
+- `VICTORY_TEXTURE_MAX=0`, including under memory pressure. Do not override it.
+- Shader optimization mask `59` (REUSE off) and pipeline skip
+  `f16876929fa64f9f`. The skip works around an AMD compiler crash and can affect
+  skinned animation velocity; do not silently remove or broaden it.
+- Residency/memory limits and 256 KiB host-window tracking.
+- Normal `VICTORY_LATE_WAIT=0` for synchronized in-place RT arenas.
+
+`-Performance` enables renderer ports 1, 2, 5, 6 and 7 and a 33.333 ms frame
+interval. Experiments commonly override `VICTORY_LATE_WAIT=3` and
+`VICTORY_CARD_BUFFERS_MIN_MB=1`; these are experiment settings, not silent
+changes to the normal preset.
+
+Game executable used by existing logs:
+
+`C:\Users\FlowUp\Downloads\GTA6\game_scarlett_master.exe`
+
+Logs are under `C:\Users\FlowUp\AppData\Local\victory\logs`. The launcher records
+its evidence settings at the top of each log. With `-BenchmarkSeconds`, timeout
+includes loading and forcibly reaps the title; expect launcher status `-1`.
+
+In-process A/B syntax is `VICTORY_AB=12,<switch>`. Phase 0 is off, phase 1 on,
+then phases alternate. Summaries report frames, mean/median/p90 frame time and
+draws/frame. Compare local costs and draw counts as well as whole-frame time;
+scene/streaming changes frequently confound naive cross-phase or cross-run
+comparisons.
+
+## All branch modifications through `128cf88`
+
+The branch is 16 commits ahead of `origin/a-publier` at this handoff baseline.
+This table lists every branch commit, including merge/documentation commits.
+
+| Commit | Modification |
+| --- | --- |
+| `96eccc3` | Scope compiler-crash records and shader skips by translation/driver fingerprint; apply skips during early and normal pipeline creation; preserve legacy record compatibility and warm-up handling. |
+| `c9c9bd9` | Open synchronized RT arenas in place instead of copying them, with synchronous submission required for safety. |
+| `1e6f01e` | Protect upload headroom and residency behavior on smaller-RAM PCs. |
+| `f55cdd8` | Use borderless fullscreen and monitor-aware window placement; associated host/HLE lifecycle integration. |
+| `5293266` | Allow scripted input in release benchmarks (bounded `VICTORY_KEYS`). |
+| `2a35a38` | Add bounded native RX 9070 benchmark launcher options, preset/evidence logging and `docs/rx-9070-xt.md`. |
+| `278a482` | Merge `origin/a-publier` at `4eb6cfd` into the RX branch and resolve integration conflicts. |
+| `06fdea2` | Document upstream integration validation. |
+| `efbf23a` | Unroll safe landing merge to two 32-byte blocks while keeping both iterations inside fault labels; add measurements. |
+| `cb5d4fb` | Coalesce nearby card-upload dirty ranges, including bounded gaps, with matching relay bookkeeping. |
+| `d5aa51d` | Instrument card-copy preparation: gathering, byte taking and upload-list recording costs. |
+| `a2bcf2a` | Find card-refresh changes directly by dword rather than scalar widening; retain the old route for diagnosis. |
+| `64ef7b5` | Avoid one-piece refresh-journal piece-list allocation with a direct one-shard walk and randomized coverage. |
+| `c62b7d4` | Document rejected refresh/cache follow-ups and correct benchmark units to milliseconds. |
+| `4229146` | Combine per-shadow page/range copy watermarks under one `RwLock`; shared unchanged checks, exclusive updates, diagnostic exclusive-read A/B. |
+| `128cf88` | Document shared-watermark native A/B and validation; no FPS improvement claimed. |
+
+Net committed changes relative to `origin/a-publier` touch 15 files: `README.md`,
+GPU `draw.rs`, `host.rs`, pipeline files, `residency.rs`, `safecopy.rs`,
+`shadow.rs`, `watch.rs`, HLE lifecycle/input files and manifest,
+`docs/rx-9070-xt.md`, and `scripts/play.ps1`. The merge also brought upstream
+history; do not treat every file in individual commit name lists as a net diff
+against the final upstream base.
+
+Pending t21 modifies only `land.rs` and `land/tests.rs`, as described above.
+
+## Measured but rejected or unproven work — do not retry blindly
+
+- Shader mask 63/REUSE did not establish a win over mandatory mask 59; shader
+  cost varied heavily with scene. Keep mask 59.
+- Fusing ordinary card-refresh comparison with CPU-held updates passed
+  equivalence tests but not whole-frame A/B; removed.
+- Eight view-worker threads did not reduce the heap-slot walk versus four;
+  rejected.
+- An exact-byte AVX2 changed-run encoder had inconclusive whole-frame A/B and
+  was not retained.
+- Combining remaining submission ranges with refresh observation did not
+  materially reduce query counts.
+- Page-atomic copy-back publication did not improve its microbenchmark.
+- Dirty-byte recording batched across refresh pages was scene-confounded and
+  had limited locking benefit; not promoted.
+- A globally retired no-change refresh cache passed focused tests after landing
+  invalidation fixes but had **zero native hits**; fully removed.
+- Shared copy-watermark locking is retained as a smaller lock protocol, but its
+  A/B did not establish an FPS win. Do not cite it as such.
+- t21 larger landing jobs are pending, not accepted. See the exact state above.
+
+## Git/PR discipline
+
+- Inspect `git status --short --branch` before edits and before cleanup.
+- Never discard pre-existing or uncommitted work with broad restore commands.
+- Stage only intended files, review `git diff --check` and the final diff, run
+  focused plus serial tests, commit, and push `fork/amd-rx9070-native30`.
+- Keep rejected experiments documented rather than repeatedly retesting them.
+- No pull request until repeatable native-1440p RT heavy scenes and transitions
+  demonstrate stable 30 fps without quality reductions.
