@@ -2325,6 +2325,9 @@ fn rehash_runs() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+#[cfg(feature = "diagnostics")]
+static CARD_TIMING: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
 /// default). The pieces the card's compare found differing come down in
@@ -3836,6 +3839,22 @@ fn late_line(frames: f64) {
                 t[3] / 1000.0,
             );
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            let t = [0, 1, 2, 3, 4].map(|i| CARD_TIMING[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let d = [0, 1, 2].map(|i| crate::shadow::CARD_DIRTY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "card-copy preparation per frame: {:.2} ms in {:.1} plans ({:.2} gathering dirty ranges, {:.2} taking bytes, {:.2} recording upload lists); joining {:.0} ranges into {:.0} took {:.2} ms",
+                t[0] / 1e6,
+                t[4],
+                t[1] / 1e6,
+                t[2] / 1e6,
+                t[3] / 1e6,
+                d[0],
+                d[1],
+                d[2] / 1e6,
+            );
+        }
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         if t[0] > 0.0 {
             tracing::info!(
@@ -4459,6 +4478,8 @@ impl Host {
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
     fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+        #[cfg(feature = "diagnostics")]
+        let card_began = std::time::Instant::now();
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4479,8 +4500,12 @@ impl Host {
             }
             None => 0,
         };
+        #[cfg(feature = "diagnostics")]
+        let gather_began = std::time::Instant::now();
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        #[cfg(feature = "diagnostics")]
+        CARD_TIMING[1].fetch_add(gather_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
         gathering.end();
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
@@ -4507,9 +4532,15 @@ impl Host {
         let mut up = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
+        #[cfg(feature = "diagnostics")]
+        let take_began = std::time::Instant::now();
         let own = if send::own() { send::take(self, &dirty) } else { None };
+        #[cfg(feature = "diagnostics")]
+        CARD_TIMING[2].fetch_add(take_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
         taking.end();
         if !dirty.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let record_began = std::time::Instant::now();
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -4635,6 +4666,8 @@ impl Host {
                 fail(format_args!("host copies in the card's memory could not be brought up to date ({e})"));
             }
             used.push((false, sync));
+            #[cfg(feature = "diagnostics")]
+            CARD_TIMING[3].fetch_add(record_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
         drop(order);
         let mut plan = CardPlan {
@@ -4744,6 +4777,11 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            CARD_TIMING[0].fetch_add(card_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CARD_TIMING[4].fetch_add(1, Ordering::Relaxed);
+        }
         Some(plan)
     }
 

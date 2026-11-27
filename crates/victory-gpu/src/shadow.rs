@@ -328,6 +328,9 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+#[cfg(feature = "diagnostics")]
+pub(crate) static CARD_DIRTY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// Bytes of buffer copies in the card's memory and in windows (for the
 /// memory pressure log, [`crate::residency`]).
 pub(crate) fn live_span_bytes() -> u64 {
@@ -647,7 +650,17 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let gap = if join_card_gaps() { CARD_JOIN_GAP } else { 0 };
-                let ranges = joined_within(std::mem::take(&mut *dirty), gap);
+                #[cfg(feature = "diagnostics")]
+                let joining = std::time::Instant::now();
+                let taking = std::mem::take(&mut *dirty);
+                #[cfg(feature = "diagnostics")]
+                CARD_DIRTY[0].fetch_add(taking.len() as u64, Ordering::Relaxed);
+                let ranges = joined_within(taking, gap);
+                #[cfg(feature = "diagnostics")]
+                {
+                    CARD_DIRTY[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                    CARD_DIRTY[2].fetch_add(joining.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
