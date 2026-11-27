@@ -242,6 +242,16 @@ The rejected t21 experiment left `land.rs` and `land/tests.rs` unchanged.
   benefit across two native A/B runs; the experiment was removed. See
   `docs/rx-9070-xt.md` for the paired measurements.
 
+## General optimization and benchmark discipline
+
+- Keep screenshots to the minimum needed for visual correctness evidence. After
+  every screenshot, benchmark, or other runtime check, run the relevant cleanup
+  and confirm that no title, benchmark, screenshot, or viewer process remains.
+- Profile before optimizing: define measured hotspots and target those with
+  focused, bounded experiments. Do not try unprofiled changes or retry failed
+  experiments relentlessly; stop when the evidence rejects the hypothesis and
+  require new profiling evidence before revisiting it.
+
 ## Git/PR discipline
 
 - Inspect `git status --short --branch` before edits and before cleanup.
