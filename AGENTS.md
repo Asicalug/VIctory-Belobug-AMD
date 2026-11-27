@@ -13,7 +13,7 @@ commit and push validated work. Open a PR to `Belobug/VIctory-Belobug-AMD`
 **only after acceptance evidence is met**, then address available review
 comments. No PR is justified now: heavy scenes remain well above 33.3 ms/frame.
 
-The active goal is `happy.quail`. Tasks t1–t20 are complete; t21 is in progress.
+Tasks t1–t21 are complete. No further landing-job experiment is pending.
 
 ## Exact handoff state
 
@@ -30,76 +30,29 @@ The active goal is `happy.quail`. Tasks t1–t20 are complete; t21 is in progres
   already integrated.
 - Committed code/evidence baseline before this handoff file: `128cf88`.
 - All committed work through `128cf88` is pushed to the fork.
-- The t21 experiment is deliberately **uncommitted** in:
-  - `crates/victory-gpu/src/land.rs`
-  - `crates/victory-gpu/src/land/tests.rs`
-- `AGENTS.md` is the only handoff documentation addition. Do not restore the two
-  t21 source files when resuming; their diff is the pending experiment.
+- The t21 source experiment has been reverted; no t21 source modifications
+  remain in `crates/victory-gpu/src/land.rs` or `land/tests.rs`.
+- The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
 - Latest native log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-165120-15104.log`.
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-194955-20680.log`.
 - That run had no panic, device removal, or out-of-memory report. Launcher exit
   `-1` was the intended benchmark timeout killing the title, not a title crash.
 
-## Resume t21 here
+## Completed t21 decision
 
-Hypothesis: increasing landing jobs from 256 KiB to 512 KiB could reduce the
-number of per-job guard-note flushes. The latest earlier heavy sample had about
-503 jobs/frame and 6.14 ms of guard opening/noting across landing threads. Jobs
-must still never split a 64 KiB title block or change piece order/merge bytes.
+The 512 KiB landing-job target was **not retained**. The first native A/B's
+whole-frame advantage did not repeat, and neither fetched-merge nor guard
+opening/noting costs showed a repeatable local reduction. The two bounded runs
+and their paired heavy-phase measurements are recorded in
+`docs/rx-9070-xt.md`, under "Rejected larger landing jobs". Only the two t21
+source diffs were reverted; the default remains 256 KiB and no experiment switch
+or temporary test remains.
 
-Current uncommitted implementation:
-
-- Adds `land::job_bytes()`; default remains 256 KiB.
-- Diagnostics A/B switch `VICTORY_LAND_JOB_512` selects 512 KiB only in its on
-  phases.
-- Splits the existing job construction into `jobs_with(pieces, target)` so tests
-  can check explicit targets.
-- Adds `job_targets_preserve_pieces_and_whole_blocks`, covering exact targets,
-  complete piece coverage, block boundaries, a block larger than its target, and
-  empty input.
-
-Validation already completed for this exact experiment:
-
-- `cargo test --locked -p victory-gpu land::tests -- --test-threads=1`:
-  **8 passed, 0 failed, 1 ignored**.
-- `cargo check --locked -p victory-gpu --features diagnostics`: passed.
-- `git diff --check`: passed before the native run.
-- The last complete serial suite was before t21: **399 passed, 35 ignored**.
-  Rerun it after the retention decision; the new test should add one test.
-
-Native `play-20261127-165120-15104.log` alternated every 12 seconds. Selected
-completed phases:
-
-| Phase | Job target | Mean / median ms | Draws/frame | Fetched-merge ms | Jobs/frame | Guard-note ms |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 9 | 512 KiB | 86.2 / 62.6 | 1,902 | 13.84 | 441 | 5.68 |
-| 10 | 256 KiB | 105.5 / 77.4 | 1,906 | 14.17 | 479 | 4.30 |
-| 11 | 512 KiB | 97.3 / 66.0 | 4,706 | 15.89 | 499 | 5.47 |
-| 12 | 256 KiB | 117.9 / 76.0 | 4,945 | 13.22 | 458 | 4.91 |
-
-Whole-frame results look favorable in these pairs, but this is **not yet causal
-evidence**: scene work, fetched work, job counts and guard-note time vary, and
-the intended local note-time reduction did not occur. Job counts did not halve.
-Phases 7/8 had much larger draw-count differences (1,049 versus 1,577), so do
-not use them as a matched pair.
-
-Next action: analyze/repeat the existing A/B in stable heavy phases; compare
-local landing and guard-note costs as well as frame time. Retain and change the
-default only with repeatable local/whole-frame benefit. Otherwise revert only
-the two t21 source diffs and record the rejected result. Do not start another
-long benchmark before reviewing this log.
-
-Repeat command, when needed:
-
-```bash
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "& 'C:\Users\FlowUp\VIctory-Belobug-AMD\scripts\play.ps1' -Exe 'C:\Users\FlowUp\Downloads\GTA6\game_scarlett_master.exe' -Rx9070 -Performance -Build diag -BenchmarkSeconds 180 -Keys '20:Enter,40:Enter,60:Enter,80:Enter,100:Enter,120:Enter' -More @{ VICTORY_LATE_WAIT = '3'; VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_AB = '12,VICTORY_LAND_JOB_512' }"
-```
-
-After t21, profile relay landing and heap-view critical paths again before
-choosing another optimization. Earlier heavy samples put roughly 31 ms in relay
-landing and 20.8 ms in the heap-slot walk, but these overlap other worker costs.
+Before choosing another optimization, profile relay landing and heap-view
+critical paths again. Earlier heavy samples put roughly 31 ms in relay landing
+and 20.8 ms in the heap-slot walk, but these overlap other worker costs.
 
 ## How the repository works
 
@@ -264,7 +217,7 @@ GPU `draw.rs`, `host.rs`, pipeline files, `residency.rs`, `safecopy.rs`,
 history; do not treat every file in individual commit name lists as a net diff
 against the final upstream base.
 
-Pending t21 modifies only `land.rs` and `land/tests.rs`, as described above.
+The rejected t21 experiment left `land.rs` and `land/tests.rs` unchanged.
 
 ## Measured but rejected or unproven work — do not retry blindly
 
@@ -285,7 +238,9 @@ Pending t21 modifies only `land.rs` and `land/tests.rs`, as described above.
   invalidation fixes but had **zero native hits**; fully removed.
 - Shared copy-watermark locking is retained as a smaller lock protocol, but its
   A/B did not establish an FPS win. Do not cite it as such.
-- t21 larger landing jobs are pending, not accepted. See the exact state above.
+- t21 larger landing jobs did not provide repeatable local or whole-frame
+  benefit across two native A/B runs; the experiment was removed. See
+  `docs/rx-9070-xt.md` for the paired measurements.
 
 ## Git/PR discipline
 
