@@ -9952,6 +9952,9 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // Keep Alt+Enter away from DXGI's implicit exclusive-mode resize.
+            // The title's own fullscreen switch and our borderless toggle stay.
+            factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER)?;
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -11438,4 +11441,3 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(None), 10_000);
     }
 }
-

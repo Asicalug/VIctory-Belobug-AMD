@@ -8,13 +8,16 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi as gdi;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
 use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm, HMENU};
 use windows_sys::core::{PCSTR, PCWSTR, w};
 
@@ -96,6 +99,93 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+/// The styles and placement a borderless window had before Alt+Enter.
+#[derive(Clone, Copy)]
+struct Windowed {
+    style: isize,
+    ex_style: isize,
+    placement: wm::WINDOWPLACEMENT,
+}
+
+static WINDOWED: LazyLock<Mutex<HashMap<usize, Windowed>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Toggle borderless fullscreen without DXGI's implicit exclusive-mode path.
+/// The swap-chain size stays unchanged: DWM scales it to the monitor.
+fn toggle_borderless(hwnd: HWND) {
+    let key = hwnd as usize;
+    let saved = WINDOWED.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    // SAFETY: styles, placement and monitor rectangles belong to this live window.
+    unsafe {
+        if let Some(saved) = saved {
+            wm::SetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE, saved.ex_style);
+            wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, saved.style);
+            wm::SetWindowPlacement(hwnd, &saved.placement);
+            let visibility = if saved.style & wm::WS_VISIBLE as isize != 0 {
+                wm::SWP_SHOWWINDOW
+            } else {
+                wm::SWP_HIDEWINDOW
+            };
+            wm::SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                wm::SWP_NOMOVE
+                    | wm::SWP_NOSIZE
+                    | wm::SWP_NOZORDER
+                    | wm::SWP_NOACTIVATE
+                    | wm::SWP_FRAMECHANGED
+                    | visibility,
+            );
+            return;
+        }
+        let monitor = gdi::MonitorFromWindow(hwnd, gdi::MONITOR_DEFAULTTONEAREST);
+        let mut info = gdi::MONITORINFO {
+            cbSize: size_of::<gdi::MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let mut placement = wm::WINDOWPLACEMENT {
+            length: size_of::<wm::WINDOWPLACEMENT>() as u32,
+            ..Default::default()
+        };
+        if gdi::GetMonitorInfoW(monitor, &mut info) == 0
+            || wm::GetWindowPlacement(hwnd, &mut placement) == 0
+        {
+            return;
+        }
+        let style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE);
+        let ex_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE);
+        WINDOWED.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            Windowed {
+                style,
+                ex_style,
+                placement,
+            },
+        );
+        wm::SetWindowLongPtrW(
+            hwnd,
+            wm::GWL_STYLE,
+            (style & !(wm::WS_OVERLAPPEDWINDOW as isize))
+                | wm::WS_POPUP as isize
+                | wm::WS_VISIBLE as isize,
+        );
+        let area = info.rcMonitor;
+        wm::SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            area.left,
+            area.top,
+            area.right - area.left,
+            area.bottom - area.top,
+            wm::SWP_NOZORDER | wm::SWP_NOACTIVATE | wm::SWP_FRAMECHANGED | wm::SWP_SHOWWINDOW,
+        );
+    }
+}
+
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
     class: PCWSTR,
@@ -153,21 +243,83 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
+/// `VICTORY_WINDOW_MONITOR=N` selects a one-based display for the initial
+/// window; without it the primary display's existing behavior is unchanged.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
-    let mut area = RECT::default();
-    // SAFETY: `area` receives the primary monitor's work area.
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+    let monitor = window_monitor();
+    let Some(area) = work_area(monitor) else {
+        return (x, y, width, height);
+    };
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
+    if !parent.is_null() || (monitor == 1 && fitted == (width, height)) {
         return (x, y, width, height);
     }
-    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
+    tracing::info!(width, height, to = ?fitted, ?limit, monitor, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+fn window_monitor() -> usize {
+    static MONITOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MONITOR.get_or_init(|| {
+        let value = std::env::var("VICTORY_WINDOW_MONITOR").unwrap_or_else(|_| "1".into());
+        match value.trim().parse::<usize>() {
+            Ok(monitor) if monitor > 0 => monitor,
+            _ => {
+                tracing::warn!(value, "ignoring invalid VICTORY_WINDOW_MONITOR; expected a positive display number");
+                1
+            }
+        }
+    })
+}
+
+fn work_area(monitor: usize) -> Option<RECT> {
+    let mut primary = RECT::default();
+    // SAFETY: `primary` receives the primary monitor's work area.
+    let known = unsafe {
+        wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut primary).cast(), 0) != 0
+    };
+    if monitor == 1 {
+        return known.then_some(primary);
+    }
+    unsafe extern "system" fn collect(
+        handle: gdi::HMONITOR,
+        _dc: gdi::HDC,
+        _bounds: *mut RECT,
+        data: LPARAM,
+    ) -> i32 {
+        // SAFETY: `data` is the live vector in `work_area`; the monitor handle
+        // and information structure are valid for this synchronous callback.
+        unsafe {
+            let areas = &mut *(data as *mut Vec<RECT>);
+            let mut info = gdi::MONITORINFO {
+                cbSize: size_of::<gdi::MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if gdi::GetMonitorInfoW(handle, &mut info) != 0 {
+                areas.push(info.rcWork);
+            }
+        }
+        1
+    }
+    let mut areas = Vec::new();
+    // SAFETY: the callback and its vector remain live throughout enumeration.
+    let enumerated = unsafe {
+        gdi::EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(collect),
+            &raw mut areas as isize,
+        ) != 0
+    };
+    let selected = areas.get(monitor - 1).copied();
+    if enumerated && selected.is_none() {
+        tracing::warn!(monitor, available = areas.len(), "requested title display is unavailable; using the primary display");
+    }
+    selected.or(known.then_some(primary))
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
@@ -246,6 +398,17 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // DXGI's Alt+Enter transition can leave the title's message thread stuck.
+    // Borderless fullscreen needs no swap-chain resize or exclusive mode.
+    if (message == wm::WM_SYSKEYDOWN || message == wm::WM_SYSKEYUP)
+        && wparam == VK_RETURN as usize
+        && lparam & (1 << 29) != 0
+    {
+        if message == wm::WM_SYSKEYDOWN && lparam & (1 << 30) == 0 {
+            toggle_borderless(hwnd);
+        }
+        return 0;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -266,6 +429,7 @@ extern "system" fn window_proc(
         let title = wm::GetPropW(hwnd, TITLE_PROC);
         if message == wm::WM_NCDESTROY {
             wm::RemovePropW(hwnd, TITLE_PROC);
+            WINDOWED.lock().unwrap_or_else(|e| e.into_inner()).remove(&(hwnd as usize));
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
@@ -556,6 +720,89 @@ mod tests {
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
+            wm::DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn alt_enter_toggles_borderless_and_restores_the_window() {
+        fn corners(r: RECT) -> (i32, i32, i32, i32) {
+            (r.left, r.top, r.right, r.bottom)
+        }
+
+        let null = std::ptr::null_mut();
+        let style = wm::WS_OVERLAPPEDWINDOW;
+        let hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("borderless"),
+            style,
+            80,
+            90,
+            640,
+            360,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+        // SAFETY: our window and monitor handles; all messages are synchronous
+        // because this thread owns the window.
+        unsafe {
+            wm::SetWindowPos(
+                hwnd,
+                null,
+                80,
+                90,
+                640,
+                360,
+                wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+            );
+            let mut before = RECT::default();
+            assert_ne!(wm::GetWindowRect(hwnd, &mut before), 0);
+            let saved_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE);
+            let saved_ex_style = wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE);
+            let enter = (1isize << 29) as LPARAM;
+            wm::SendMessageW(hwnd, wm::WM_SYSKEYDOWN, VK_RETURN as usize, enter);
+            wm::SendMessageW(
+                hwnd,
+                wm::WM_SYSKEYUP,
+                VK_RETURN as usize,
+                enter | (1isize << 30) as LPARAM | (1isize << 31) as LPARAM,
+            );
+
+            let monitor = gdi::MonitorFromWindow(hwnd, gdi::MONITOR_DEFAULTTONEAREST);
+            let mut info = gdi::MONITORINFO {
+                cbSize: size_of::<gdi::MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            assert_ne!(gdi::GetMonitorInfoW(monitor, &mut info), 0);
+            let mut full = RECT::default();
+            assert_ne!(wm::GetWindowRect(hwnd, &mut full), 0);
+            assert_eq!(corners(full), corners(info.rcMonitor));
+            assert_eq!(
+                wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE) & wm::WS_CAPTION as isize,
+                0
+            );
+            assert!(WINDOWED.lock().unwrap().contains_key(&(hwnd as usize)));
+
+            // Holding the key must not repeatedly leave and re-enter fullscreen.
+            wm::SendMessageW(
+                hwnd,
+                wm::WM_SYSKEYDOWN,
+                VK_RETURN as usize,
+                enter | (1isize << 30) as LPARAM,
+            );
+            assert!(WINDOWED.lock().unwrap().contains_key(&(hwnd as usize)));
+
+            wm::SendMessageW(hwnd, wm::WM_SYSKEYDOWN, VK_RETURN as usize, enter);
+            let mut after = RECT::default();
+            assert_ne!(wm::GetWindowRect(hwnd, &mut after), 0);
+            assert_eq!(corners(after), corners(before));
+            assert_eq!(wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE), saved_style);
+            assert_eq!(wm::GetWindowLongPtrW(hwnd, wm::GWL_EXSTYLE), saved_ex_style);
+            assert!(!WINDOWED.lock().unwrap().contains_key(&(hwnd as usize)));
             wm::DestroyWindow(hwnd);
         }
     }
