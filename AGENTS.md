@@ -29,29 +29,33 @@ retained and validated; native heavy-scene acceptance remains unmet.
   not the older, divergent `origin/main`.
 - Last pull of `origin/a-publier`: `Already up to date`; all its commits were
   already integrated.
-- Last committed code/evidence baseline before the copy-back change: `a30e490`.
-- All committed work through `a30e490` is pushed to the fork.
+- Last committed code/evidence baseline before synchronous direct uploads:
+  `efc1b65`.
+- All committed work through `efc1b65` is pushed to the fork.
 - The t21 source experiment has been reverted; no t21 source modifications
   remain in `crates/victory-gpu/src/land.rs` or `land/tests.rs`.
 - The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
 - Latest default-release acceptance log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-215334-22336.log`.
-- Latest diagnostics copy-back A/B log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-214230-9640.log`;
-  the memory-census log remains `play-20261127-210714-12456.log`.
-- The default-release run held 30 fps in the opening/menu, but heavy 3D was
-  generally 5–6.6 fps. Final samples were 6.5 fps at 155.0/154.1 ms with about
-  5,000 draws; a heavy transition reached 940.4 ms. Acceptance remains unmet; no PR.
-- It had no panic, device removal, or out-of-memory report. Launcher exit `-1`
-  was the intended benchmark timeout killing the title, not a title crash.
-- Final heavy costs were about 52–53 ms preparing, 21 ms copies, 64–65 ms on
-  the GPU, and 33 ms copying back. Earlier baseline `204114-1604` instead had a
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-222102-12860.log`.
+- Latest diagnostics direct-upload A/B log:
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-221132-2864.log`;
+  its preparation profile is `play-20261127-220352-14284.log`. The ordered
+  copy-back A/B remains `play-20261127-214230-9640.log`, and the memory census
+  remains `play-20261127-210714-12456.log`.
+- The default-release run held 30 fps in the opening/menu, but heavy 3D did not
+  meet acceptance. Final samples were 7.4/7.2 fps at 135.6/138.4 ms with about
+  5,000 draws; a heavy transition reached 1,114.1 ms. No PR is justified.
+- It had no panic, device removal, out-of-memory report or fatal runtime error.
+  Launcher exit `-1` was the intended benchmark timeout killing the title, not
+  a title crash. Explicit cleanup confirmed zero benchmark processes.
+- Final heavy costs were 42.5 ms preparing (22.1 ms copies), 59.8 ms on the GPU,
+  and 32.5 ms copying back. Earlier baseline `204114-1604` instead had a
   61.4 ms preparation / 49.2 ms copy-back representative sample; scenes differ,
   so do not claim a whole-frame improvement from those two runs. The
   109,104-shape / 3,710.5-MiB cumulative list-making figures belong to earlier
-  diagnostics, principally `201726-9068`, not either release log.
+  diagnostics, principally `201726-9068`, not the release logs.
 - The heap-slot profile and rejected placed-shape hash-table experiment are
   documented in `docs/rx-9070-xt.md`; their temporary source changes were
   reverted. The memory-usage investigation is complete and documented below.
@@ -93,6 +97,31 @@ an incremental optimization, not stable-30 evidence. The default release check
 used no screenshots, and were explicitly cleaned up to zero benchmark processes.
 The complete serial GPU suite passed 399 tests with 35 ignored; diagnostics
 check and both builds passed. Full evidence is in `docs/rx-9070-xt.md`.
+
+## Synchronous direct-upload decision
+
+Synchronous card uploads now read dirty ranges directly from their existing CPU
+staging sides by default. The submission lock is held until every list has been
+waited for, so a later submission cannot refresh those bytes first. Late/relay
+submissions still require `send::take()` snapshots. Set
+`VICTORY_SYNC_SEND_DIRECT=0` to restore synchronous snapshots for diagnosis.
+
+Preparation profile `220352-14284` found 15.12 ms in representative card-copy
+preparation, including 11.92 ms taking bytes, 1.62 ms gathering and 1.44 ms
+recording. Other late costs remained about 29 ms in list steps (22–23 ms
+refreshes), 6.8 ms snapshots and 63–65 ms on the GPU. In direct-upload A/B
+`221132-2864`, the closest heavy phases 12→13 improved from 180.3 to 152.8 ms
+mean, 176.1 to 153.3 ms median and 199.3 to 162.8 ms p90 at 5,071→4,954 draws.
+Local preparation fell from 15.12 to 2.98 ms and taking bytes to zero. Phase 14
+returned to snapshots at 165.0 ms mean / 4,965 draws. Phases 8→9 did not improve
+(205.3→208.2 ms at 3,252→3,172 draws), so do not claim a universal multiplier.
+
+Default release `222102-12860` retained every native-quality setting and ended
+at 7.4/7.2 fps, 135.6/138.4 ms around 5,000 draws, with a 1,114.1 ms transition.
+Acceptance remains unmet. The runs used no screenshots and were explicitly
+cleaned up to zero processes. Diagnostics check, both builds and all 399 serial
+GPU library tests passed, with 35 ignored. Full evidence is in
+`docs/rx-9070-xt.md`.
 
 ## Memory investigation result
 
@@ -207,11 +236,12 @@ Do **not** run `cargo fmt --all`: the current toolchain reformatted about 142
 otherwise untouched files earlier. Keep diffs scoped, format touched code
 carefully, and use `git diff --check`.
 
-Copy-back validation: diagnostics check and both builds passed; the complete
-serial GPU library suite passed 399 tests with 35 ignored. Existing randomized
-landing-order coverage checks byte coverage, cross-copy block order and job
-boundaries. `git diff --check` is clean. Memory-census validation had the same
-serial-suite result and a passing diagnostics build.
+Copy-back and synchronous direct-upload validation: diagnostics check and both
+builds passed; the complete serial GPU library suite passed 399 tests with 35
+ignored. Existing randomized landing-order coverage checks byte coverage,
+cross-copy block order and job boundaries. `git diff --check` is clean.
+Memory-census validation had the same serial-suite result and a passing
+diagnostics build.
 
 Last committed t20 validation: 399 serial GPU library tests passed, 35 ignored;
 focused crash-record and four residency tests passed. Earlier upstream

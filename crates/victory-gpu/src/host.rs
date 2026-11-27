@@ -3849,22 +3849,7 @@ fn late_line(frames: f64) {
                 t[3] / 1000.0,
             );
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            let t = [0, 1, 2, 3, 4].map(|i| CARD_TIMING[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            let d = [0, 1, 2].map(|i| crate::shadow::CARD_DIRTY[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            tracing::info!(
-                "card-copy preparation per frame: {:.2} ms in {:.1} plans ({:.2} gathering dirty ranges, {:.2} taking bytes, {:.2} recording upload lists); joining {:.0} ranges into {:.0} took {:.2} ms",
-                t[0] / 1e6,
-                t[4],
-                t[1] / 1e6,
-                t[2] / 1e6,
-                t[3] / 1e6,
-                d[0],
-                d[1],
-                d[2] / 1e6,
-            );
-        }
+        // Card-copy preparation is reported on the common frame path below.
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         if t[0] > 0.0 {
             tracing::info!(
@@ -4544,7 +4529,9 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         #[cfg(feature = "diagnostics")]
         let take_began = std::time::Instant::now();
-        let own = if send::own() { send::take(self, &dirty) } else { None };
+        // Late submissions still need their own snapshot. With no flight in
+        // the air the direct source cannot be refreshed before the wait below.
+        let own = if send::own() && (late() || !send::sync_direct()) { send::take(self, &dirty) } else { None };
         #[cfg(feature = "diagnostics")]
         CARD_TIMING[2].fetch_add(take_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
         taking.end();
@@ -9461,6 +9448,19 @@ impl Meter {
             late_line(frames);
             #[cfg(feature = "diagnostics")]
             {
+                let t = [0, 1, 2, 3, 4].map(|i| CARD_TIMING[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                let d = [0, 1, 2].map(|i| crate::shadow::CARD_DIRTY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "card-copy preparation per frame: {:.2} ms in {:.1} plans ({:.2} gathering dirty ranges, {:.2} taking bytes, {:.2} recording upload lists); joining {:.0} ranges into {:.0} took {:.2} ms",
+                    t[0] / 1e6,
+                    t[4],
+                    t[1] / 1e6,
+                    t[2] / 1e6,
+                    t[3] / 1e6,
+                    d[0],
+                    d[1],
+                    d[2] / 1e6,
+                );
                 let m = [0, 1, 2, 3, 4, 5].map(|i| CARD_MERGE_TIMING[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 if m[0] > 0.0 || m[3] > 0.0 {
                     tracing::info!(

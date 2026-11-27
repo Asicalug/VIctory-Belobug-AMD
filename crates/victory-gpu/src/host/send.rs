@@ -27,6 +27,17 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether a fully synchronous submission copies card-bound dirty ranges
+/// directly from their CPU sides (on by default; `VICTORY_SYNC_SEND_DIRECT=0`
+/// takes a submission-owned snapshot instead).
+/// This is not offered with [`super::late`]: there a later submission may refresh
+/// a CPU side before an earlier one runs, so [`take`] must keep its own bytes.
+/// Without late submission, `Host::submit` waits for every list before the
+/// submission lock is released, so no later submission can change the source.
+pub(super) fn sync_direct() -> bool {
+    crate::toggled!("VICTORY_SYNC_SEND_DIRECT")
+}
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
