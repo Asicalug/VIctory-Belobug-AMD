@@ -622,7 +622,8 @@ impl SentRuns {
 
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
-/// they touch. The ranges are taken: the caller copies them to the card's
+/// they touch (card uploads also include gaps of at most [`CARD_JOIN_GAP`]).
+/// The ranges are taken: the caller copies them to the card's
 /// side (`Host::card_before`).
 ///
 /// With [`relay`], `sent_as` is the number of the send that takes them
@@ -645,7 +646,8 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = joined(std::mem::take(&mut *dirty));
+                let gap = if join_card_gaps() { CARD_JOIN_GAP } else { 0 };
+                let ranges = joined_within(std::mem::take(&mut *dirty), gap);
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
@@ -760,18 +762,38 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 }
 
 /// Ranges in order, those that overlap or touch as one.
-fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+fn joined(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    joined_within(ranges, 0)
+}
+
+/// Ranges in order, with gaps of at most `gap` bytes included in one range.
+fn joined_within(mut ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     // (The sort that finds what is in order already: they come as a few
     // stretches of tens of thousands in order, put behind one another.)
     ranges.sort();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (from, to) in ranges {
         match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            Some(last) if from <= last.1.saturating_add(gap) => last.1 = last.1.max(to),
             _ => out.push((from, to)),
         }
     }
     out
+}
+
+/// Bytes between two dirty runs allowed in their one card upload.
+/// The whole joined range is snapshotted and sent, including the gap.
+const CARD_JOIN_GAP: usize = 64;
+
+/// Whether nearby dirty runs share one card upload (on by default;
+/// `VICTORY_CARD_JOIN_GAP=0` leaves gaps alone; diagnostics' A/B can alternate it).
+fn join_card_gaps() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_JOIN_GAP") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_JOIN_GAP").is_none_or(|v| v != "0"))
 }
 
 /// Runs of pieces to hash again (`Host::card_before`), those that overlap
@@ -837,7 +859,7 @@ fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs, joined_within};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -916,6 +938,15 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+        assert_eq!(
+            joined_within(vec![(160, 170), (0, 10), (75, 80), (144, 150), (300, 310)], 64),
+            [(0, 10), (75, 170), (300, 310)]
+        );
+        assert_eq!(
+            joined_within(vec![(0, usize::MAX - 1), (usize::MAX - 64, usize::MAX)], 64),
+            [(0, usize::MAX)]
+        );
+        assert_eq!(joined_within(vec![(0, 10), (75, 80)], 64), [(0, 10), (75, 80)]);
     }
 }
 
