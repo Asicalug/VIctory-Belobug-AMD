@@ -5,9 +5,10 @@
 //! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
 //! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
 //! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
-//! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
-//! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
-//! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.
+//! commit to 16 MiB; one-shot bakes stop below 256 MiB of commit. With 32 GiB
+//! of RAM or less (or `VICTORY_RESIDENCY_LIMITED=1`), speculative texture work
+//! stops below 2 GiB and new staging blocks below 3 GiB; larger PCs keep the
+//! 512 MiB / 1 GiB floors.
 //! Off, nothing here changes anything, except that for 500 ms after the card
 //! refused memory (E_OUTOFMEMORY) the texture pass stops ([`upload_refused`]).
 use std::sync::OnceLock;
@@ -72,18 +73,32 @@ fn sample_commit(now: u64) -> u64 {
     AVAILABLE_COMMIT.load(Ordering::Relaxed)
 }
 
-fn has_upload_reserve(commit: u64, bake: bool) -> bool {
-    // Keep a protective floor against Rust/game OOM aborts without starving
-    // bindless world textures or one-shot ped decoration bakes when steady-state
-    // commit headroom sits in the 1-4 GiB range on 32 GiB hosts.
-    commit >= if bake { 256 * MIB } else { 512 * MIB }
+fn has_upload_reserve(commit: u64, bake: bool, limited: bool) -> bool {
+    // Required one-shot bakes keep the old floor. Speculative texture work on
+    // a smaller PC stops with room left for the title and other processes,
+    // rather than continuing until the whole system is about to run out.
+    let reserve = if bake {
+        256 * MIB
+    } else if limited {
+        2 * GIB
+    } else {
+        512 * MIB
+    };
+    commit >= reserve
 }
 
-fn has_growth_reserve(commit: u64, bake: bool) -> bool {
+fn has_growth_reserve(commit: u64, bake: bool, limited: bool) -> bool {
     // Growing a fresh 64 MiB upload block for speculative bindless prefetch
     // requires more headroom than reusing slices already committed inside the
     // staging pool.
-    commit >= if bake { 256 * MIB } else { 1024 * MIB }
+    let reserve = if bake {
+        256 * MIB
+    } else if limited {
+        3 * GIB
+    } else {
+        1024 * MIB
+    };
+    commit >= reserve
 }
 
 /// Leave commit for game allocations and submissions already in flight while
@@ -96,7 +111,7 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if !on() {
         return true;
     }
-    has_upload_reserve(sample_commit(now), bake)
+    has_upload_reserve(sample_commit(now), bake, limited_host_ram())
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
@@ -110,7 +125,7 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    has_growth_reserve(sample_commit(now), bake, limited_host_ram())
 }
 
 pub(crate) fn limited_host_ram() -> bool {
@@ -203,10 +218,20 @@ mod tests {
             (768 * MIB, true, true, false),
             (1024 * MIB, true, true, true),
         ] {
-            assert_eq!(has_upload_reserve(commit, true), bake);
-            assert_eq!(has_upload_reserve(commit, false), lookahead);
-            assert_eq!(has_growth_reserve(commit, false), growth);
+            assert_eq!(has_upload_reserve(commit, true, false), bake);
+            assert_eq!(has_upload_reserve(commit, false, false), lookahead);
+            assert_eq!(has_growth_reserve(commit, false, false), growth);
         }
+    }
+
+    #[test]
+    fn smaller_pcs_stop_speculative_growth_before_commit_is_exhausted() {
+        assert!(has_upload_reserve(256 * MIB, true, true));
+        assert!(has_growth_reserve(256 * MIB, true, true));
+        assert!(!has_upload_reserve(2 * GIB - MIB, false, true));
+        assert!(has_upload_reserve(2 * GIB, false, true));
+        assert!(!has_growth_reserve(3 * GIB - MIB, false, true));
+        assert!(has_growth_reserve(3 * GIB, false, true));
     }
 
     #[test]
