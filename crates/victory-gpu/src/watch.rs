@@ -173,6 +173,13 @@ impl Notes {
     /// The notes of pages `[first, last)` in page order, `each` of them
     /// until it says no: whether it never did. A part at a time.
     fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        // Most refresh ranges touch one shard. Avoid allocating their
+        // one-element piece list; the range, lock order and early exit are the
+        // same as in the general path below.
+        if first < last && first >> SHARD_SHIFT == (last - 1) >> SHARD_SHIFT && one_shard() {
+            let s = self.read(shard_of(first));
+            return s.written.range(first..last).all(|(&p, &w)| each(p, w));
+        }
         match pieces(first, last) {
             Some(pieces) => pieces.into_iter().all(|(from, to)| {
                 let s = self.read(shard_of(from));
@@ -226,6 +233,12 @@ impl Notes {
         }
         held
     }
+}
+
+/// Whether the common one-shard journal walk skips its temporary piece list
+/// (`VICTORY_WATCH_ONE_SHARD=0` restores the general walk for diagnosis).
+fn one_shard() -> bool {
+    crate::toggled!("VICTORY_WATCH_ONE_SHARD")
 }
 
 /// The pieces of pages `[first, last)` in page order, each in one part;
@@ -5718,9 +5731,47 @@ mod port7_tests {
             assert_eq!(notes.range(first, last), expected, "{first}..{last} a part at a time");
             assert_eq!(notes.hold(shards_of(first, last), false).range(first, last), expected, "{first}..{last} held");
         }
+        // A whole cycle of shard numbers is not one piece: the fast path
+        // compares piece numbers, not their shards modulo SHARDS.
+        for &(first, last) in &[(0, 65 * P), (P - 1, 64 * P + 1)] {
+            let expected: Vec<(usize, u64)> = want.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(notes.range(first, last), expected, "{first}..{last} across a shard cycle");
+        }
         // The whole space: each part once.
         assert_eq!(notes.range(0, usize::MAX / 2), want.iter().map(|(&p, &w)| (p, w)).collect::<Vec<_>>());
         assert_eq!(notes.hold(u64::MAX, false).range(0, usize::MAX / 2).len(), want.len());
+    }
+
+    /// The common one-shard walk against the general piece-list walk. Run
+    /// optimized with `--ignored --nocapture`; this is a cost check, not a gate.
+    #[test]
+    #[ignore]
+    fn one_shard_walk_cost() {
+        const P: usize = 1 << SHARD_SHIFT;
+        let notes = Notes::new();
+        for page in [3, 100, 500, 900] {
+            notes.hold(shards_of_pages([page]), true).note(page, WHOLE, page as u64);
+        }
+        let (first, last) = (0, P);
+        let general = || {
+            pieces(first, last).unwrap().into_iter().all(|(from, to)| {
+                let s = notes.read(shard_of(from));
+                s.written.range(from..to).all(|_| true)
+            })
+        };
+        let direct = || notes.each(first, last, |_, _| true);
+        let best = |f: &dyn Fn() -> bool| {
+            (0..20)
+                .map(|_| {
+                    let began = std::time::Instant::now();
+                    for _ in 0..4000 {
+                        std::hint::black_box(f());
+                    }
+                    began.elapsed().as_nanos() as f64 / 4000.0
+                })
+                .fold(f64::MAX, f64::min)
+        };
+        println!("one-shard journal walk: general {:.1} ns, direct {:.1} ns", best(&general), best(&direct));
     }
 
     /// Noted out of order (shared noters' numbers may come in any order): a
