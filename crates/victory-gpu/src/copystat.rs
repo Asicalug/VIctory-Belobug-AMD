@@ -96,6 +96,10 @@ pub(crate) enum C {
     /// store to buffers, not given to shaders as written, and their bytes.
     GpuWritesLeftOut,
     GpuWritesLeftOutBytes,
+    /// The title's present call, from its beginning (our hook) to the frame
+    /// being shown: waiting for the swap chain and the card behind it, plus
+    /// what our own present path does.
+    PresentUs,
     /// Waits for memory values looked at (`list::ValueWait::met`) and the
     /// nanoseconds the looks took, on every thread.
     WaitChecks,
@@ -132,7 +136,7 @@ pub(crate) enum C {
     WaitsForBuffers,
     IndirectBounded,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 81;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -169,6 +173,20 @@ pub(crate) fn peek(c: C) -> u64 {
     let i = c as usize;
     COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
 }
+
+/// Every counter as it is now, without resetting any (the slow-frame line
+/// takes the difference of two of these, so a frame the frame-rate line's
+/// own reset falls in can be told apart).
+pub(crate) fn snapshot() -> [u64; COUNTERS] {
+    let mut out = [0; COUNTERS];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum();
+    }
+    out
+}
+
+/// How many counters [`snapshot`] gives.
+pub(crate) const COUNTED: usize = COUNTERS;
 
 /// Counter `i`, all sets together, from now on 0.
 fn taken(i: usize) -> u64 {
@@ -1082,6 +1100,9 @@ fn now_us() -> u64 {
 /// ([`now_us`]), and whether a list call and a submission followed that
 /// present yet.
 static PRESENTED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// When the title's present call began (microseconds, [`present_begins`]).
+static PRESENT_BEGAN: AtomicU64 = AtomicU64::new(0);
 static SUBMITTED_AT: AtomicU64 = AtomicU64::new(0);
 static RECORDED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static SUBMITTED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -1130,7 +1151,7 @@ fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
 }
 
 /// This thread's processor time so far (user, kernel), in microseconds.
-fn thread_times() -> (u64, u64) {
+pub(crate) fn thread_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
     let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -1248,12 +1269,15 @@ pub(crate) fn phase() -> u32 {
 /// The title calls its present (before our own copy to the window runs).
 pub(crate) fn present_begins() {
     add(C::TailUs, now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)));
+    PRESENT_BEGAN.store(now_us(), Relaxed);
 }
 
 /// A frame was presented.
 pub(crate) fn presented() {
+    let now = now_us();
+    add(C::PresentUs, now.saturating_sub(PRESENT_BEGAN.load(Relaxed)));
     add(C::Frames, 1);
-    PRESENTED_AT.store(now_us(), Relaxed);
+    PRESENTED_AT.store(now, Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
     SUBMITTED_SINCE.store(false, Relaxed);
 }

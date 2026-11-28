@@ -9387,12 +9387,65 @@ fn meter_lines(lines: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// Diagnostics: the slow-frame line's own clock, last counter reading and
+/// last draw count ([`Meter::slow_frame`]).
+#[cfg(feature = "diagnostics")]
+struct SlowFrame {
+    at: std::time::Instant,
+    counters: [u64; crate::copystat::COUNTED],
+    host: [u64; 8],
+    drawn: u64,
+    /// This thread's processor time (user, kernel) at the last frame.
+    thread: (u64, u64),
+}
+
+#[cfg(feature = "diagnostics")]
+impl SlowFrame {
+    fn new() -> Self {
+        SlowFrame {
+            at: std::time::Instant::now(),
+            counters: crate::copystat::snapshot(),
+            host: [
+                SUBMISSION_US[0].load(Ordering::Relaxed),
+                SUBMISSION_US[1].load(Ordering::Relaxed),
+                PREPARING[0].load(Ordering::Relaxed),
+                PREPARING[1].load(Ordering::Relaxed),
+                PREPARING[2].load(Ordering::Relaxed),
+                PREPARING[3].load(Ordering::Relaxed),
+                COPY_BACK[0].load(Ordering::Relaxed),
+                COPY_BACK[1].load(Ordering::Relaxed),
+            ],
+            drawn: crate::draw::drawn(),
+            thread: crate::copystat::thread_times(),
+        }
+    }
+
+    /// The counters since the last call, or `None` when the frame-rate line
+    /// reset them in between (that frame cannot be split).
+    fn counters(&mut self) -> Option<[u64; crate::copystat::COUNTED]> {
+        let now = crate::copystat::snapshot();
+        let mut out = [0; crate::copystat::COUNTED];
+        let mut whole = true;
+        for (i, o) in out.iter_mut().enumerate() {
+            match now[i].checked_sub(self.counters[i]) {
+                Some(d) => *o = d,
+                None => whole = false,
+            }
+        }
+        self.counters = now;
+        whole.then_some(out)
+    }
+}
+
 struct Meter {
     last_present: windows::core::HRESULT,
     since: std::time::Instant,
     frames: u32,
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
+    /// The slow-frame line's own clock and last reading (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    slow: SlowFrame,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -9408,6 +9461,8 @@ impl Meter {
             frames: 0,
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
+            #[cfg(feature = "diagnostics")]
+            slow: SlowFrame::new(),
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -9417,6 +9472,106 @@ impl Meter {
     /// Whether the next frame counted makes the frame-rate line.
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
+    }
+
+    /// Diagnostics: logs every frame slower than `VICTORY_SLOW_FRAME_MS`
+    /// (40 ms unless set) with what the counters say filled it, for that one
+    /// frame rather than the frame-rate line's average. The counters of the
+    /// line itself are left alone (a taken snapshot, not a reset); a frame
+    /// one of its resets falls in, or one with a wait that carried over from
+    /// the frame before, is logged as such rather than credited wrongly.
+    #[cfg(feature = "diagnostics")]
+    fn slow_frame(&mut self) {
+        static LIMIT_MS: OnceLock<f64> = OnceLock::new();
+        let limit = *LIMIT_MS.get_or_init(|| {
+            std::env::var("VICTORY_SLOW_FRAME_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(40.0)
+        });
+        let now = std::time::Instant::now();
+        let wall = now.duration_since(self.slow.at);
+        self.slow.at = now;
+        // The layer's own sums of the frame-rate line, read without resetting.
+        let host: [u64; 8] = [
+            SUBMISSION_US[0].load(Ordering::Relaxed),
+            SUBMISSION_US[1].load(Ordering::Relaxed),
+            PREPARING[0].load(Ordering::Relaxed),
+            PREPARING[1].load(Ordering::Relaxed),
+            PREPARING[2].load(Ordering::Relaxed),
+            PREPARING[3].load(Ordering::Relaxed),
+            COPY_BACK[0].load(Ordering::Relaxed),
+            COPY_BACK[1].load(Ordering::Relaxed),
+        ];
+        let draws_now = crate::draw::drawn();
+        let draws = draws_now.saturating_sub(self.slow.drawn);
+        self.slow.drawn = draws_now;
+        let before_host = std::mem::replace(&mut self.slow.host, host);
+        let Some(c) = self.slow.counters() else {
+            return;
+        };
+        // The presenting thread's own processor time in this frame: about the
+        // wall time if it was busy in the title's code or ours, next to nothing
+        // if it waited.
+        let thread = crate::copystat::thread_times();
+        let (user, kernel) = (
+            thread.0.saturating_sub(self.slow.thread.0) as f64 / 1e3,
+            thread.1.saturating_sub(self.slow.thread.1) as f64 / 1e3,
+        );
+        self.slow.thread = thread;
+        let ms = wall.as_secs_f64() * 1000.0;
+        if ms < limit {
+            return;
+        }
+        let d = |i: usize| host[i].saturating_sub(before_host[i]) as f64 / 1e3;
+        let mb = |i: usize| host[i].saturating_sub(before_host[i]) as f64 / 1e6;
+        let n = |v: crate::copystat::C| c[v as usize] as f64;
+        tracing::info!(
+            "slow frame: {ms:.1} ms, {draws} draws, this thread {user:.1} user + {kernel:.1} kernel; {prep:.1} ms preparing submissions (copies {copy:.1} ms \
+             {copy_mb:.1} MB, textures {tex:.1} ms {tex_mb:.1} MB), {card:.1} ms waiting for the card, \
+             {back:.1} ms copying back {back_mb:.1} MB; {calls:.0} list calls {rec:.1} ms, {pipe:.1} ms \
+             waiting for pipelines, {lists:.0} host lists {lists_ms:.1} ms, {reset:.1} ms resetting lists; \
+             after a present {until_rec:.1} ms to the first list call, {until_sub:.1} ms to the first \
+             submission, {tail:.1} ms from the last submission to the present; snapshots {snap:.1} ms, \
+             {differ:.0} pieces differing {scan:.1} + {sync:.1} ms, sparse {sparse:.1} ms, guards \
+             {guard:.1} ms, {waits:.0} waits for memory values {wait_ms:.1} ms, {pace:.0} frame waits \
+             sleeping {pace_ms:.1} ms, {dynamic:.0} dynamic tables {dynamic_ms:.1} ms, notes {notes:.1} ms, \
+             the present {present:.1} ms",
+            draws = draws,
+            user = user,
+            kernel = kernel,
+            prep = d(0),
+            copy = d(2),
+            copy_mb = mb(3),
+            tex = d(4),
+            tex_mb = mb(5),
+            card = d(1),
+            back = d(6),
+            back_mb = mb(7),
+            calls = n(crate::copystat::C::RecordCalls),
+            rec = n(crate::copystat::C::RecordNs) / 1e6,
+            pipe = n(crate::copystat::C::PipelineWaitUs) / 1e3,
+            lists = n(crate::copystat::C::HostLists),
+            lists_ms = n(crate::copystat::C::HostListNs) / 1e6,
+            reset = n(crate::copystat::C::ResetNs) / 1e6,
+            until_rec = n(crate::copystat::C::UntilRecordUs) / 1e3,
+            until_sub = n(crate::copystat::C::UntilSubmitUs) / 1e3,
+            tail = n(crate::copystat::C::TailUs) / 1e3,
+            snap = n(crate::copystat::C::SnapshotUs) / 1e3,
+            differ = n(crate::copystat::C::BackDiffer),
+            scan = n(crate::copystat::C::BackScanUs) / 1e3,
+            sync = n(crate::copystat::C::BackSyncUs) / 1e3,
+            sparse = n(crate::copystat::C::SparseUs) / 1e3,
+            guard = n(crate::copystat::C::GuardUs) / 1e3,
+            waits = n(crate::copystat::C::WaitChecks),
+            wait_ms = n(crate::copystat::C::WaitCheckNs) / 1e6,
+            pace = n(crate::copystat::C::PaceWaits),
+            pace_ms = n(crate::copystat::C::PaceUs) / 1e3,
+            dynamic = n(crate::copystat::C::DynamicAsked),
+            dynamic_ms = n(crate::copystat::C::DynamicNs) / 1e6,
+            notes = n(crate::copystat::C::NoteNs) / 1e6,
+            present = n(crate::copystat::C::PresentUs) / 1e3,
+        );
     }
 
     /// Record a frame once the swap chain has accepted it.
@@ -9439,6 +9594,8 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
+        #[cfg(feature = "diagnostics")]
+        self.slow_frame();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
