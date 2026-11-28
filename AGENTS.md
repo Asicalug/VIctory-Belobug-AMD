@@ -459,6 +459,22 @@ The rejected t21 experiment left `land.rs` and `land/tests.rs` unchanged.
 - A hash index for placed-view shapes passed descriptor tests but did not
   reproduce its apparent local or whole-frame benefit in a second native run;
   it was removed. Do not cite the first, lighter-scene candidate as a win.
+- Kept snapshots (`VICTORY_KEEP_SNAPSHOTS=1`) halved the snapshot cost (6.8-7.0
+  to 2.8-3.0 ms/frame) and made the frame worse: 121.6 ms against a control of
+  100.9 ms measured in the same window at 4,656-5,233 draws, because a snapshot
+  held current across submissions keeps flights in the air and costs the
+  overlap (12 ms against 23-36 ms). Rejected; nothing was promoted. Note also
+  that the identical asynchronous configuration measured 69.8-74.4 ms an hour
+  earlier, so cross-run comparisons on this machine must be paired tightly.
+- The refresh compare is not a target: the asynchronous preset compares
+  20,167.6 MB a frame to find 111 MB that differs, only landed pages are noted
+  page by page, the compare already runs at about 415 GB/s across the workers,
+  and the title rewrites nearly every page of those ranges. Page-level pruning
+  stays rejected with the range-covered sparse planner.
+- Keeping the by-address arenas in place under asynchronous submission needs
+  the BVH builder's page recycling to respect in-flight reads as well as the
+  writes to be declared, and the footprint is not worse under asynchronous
+  submission, so there is little to reclaim for that work.
 
 ## General optimization and benchmark discipline
 
