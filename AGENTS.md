@@ -36,6 +36,15 @@ retained and validated; native heavy-scene acceptance remains unmet.
 - The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
 - No `victory.exe` or `game_scarlett_master.exe` benchmark process remained after
   the last intended timeout.
+- Combined-footprint measurement is restored and bounded: `target/budget-run.ps1`
+  (budget, the reference key sequence, window in front) reached heavy 3D in all
+  three runs of 2026-11-28. Newest: `play-20261128-031412-8124.log` (budget
+  16384), `play-20261128-031945-4808.log` (budget 65536, control) and
+  `play-20261128-033301-22120.log` (budget 16384). Heavy combined footprint was
+  32,378 to 32,832 MiB with 34,885 to 35,426 MiB peaks; the budget changes it by
+  nothing measurable. See `docs/rx-9070-xt.md`, "The budget path measured at full
+  quality": the 16 GiB target and the 20 GiB ceiling are about 12.4 GiB away at
+  full quality, so they stay unmet.
 - Latest default-release acceptance log:
   `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-222102-12860.log`.
 - Latest diagnostics refresh profile:
