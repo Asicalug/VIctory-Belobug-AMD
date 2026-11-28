@@ -802,18 +802,99 @@ fn joined(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 }
 
 /// Ranges in order, with gaps of at most `gap` bytes included in one range.
-fn joined_within(mut ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
-    // (The sort that finds what is in order already: they come as a few
-    // stretches of tens of thousands in order, put behind one another.)
-    ranges.sort();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for (from, to) in ranges {
-        match out.last_mut() {
-            Some(last) if from <= last.1.saturating_add(gap) => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
-        }
+fn joined_within(ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    joined_by(ranges, gap, radix_order_on())
+}
+
+/// [`joined_within`], with the order of the first offsets found by a radix
+/// sort (`radix`) or the comparison sort.
+fn joined_by(mut ranges: Vec<(usize, usize)>, gap: usize, radix: bool) -> Vec<(usize, usize)> {
+    if radix && ranges.len() >= RADIX_ORDER {
+        ranges = ordered_by_first(ranges);
+    } else {
+        // (The sort that finds what is in order already: they come as a few
+        // stretches of tens of thousands in order, put behind one another.)
+        ranges.sort();
     }
-    out
+    // Joined in place: the merged ranges are written over the front of the
+    // same list, so a frame that notes tens of thousands of runs allocates
+    // nothing for their order.
+    let mut out: usize = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if let Some(last) = out.checked_sub(1).map(|last| &mut ranges[last])
+            && from <= last.1.saturating_add(gap)
+        {
+            last.1 = last.1.max(to);
+            continue;
+        }
+        ranges[out] = (from, to);
+        out += 1;
+    }
+    ranges.truncate(out);
+    ranges
+}
+
+/// How many ranges at once are worth ordering by radix sort: a frame notes
+/// tens of thousands of short runs from several threads at once, so they
+/// arrive in no order at all and a comparison sort spends its time in cache
+/// misses (measured: 3.0 times the radix sort's time at 87,000 runs).
+const RADIX_ORDER: usize = 256;
+
+/// [`joined_within`]'s order by first offset, with a radix sort on the
+/// offset's low bytes: stable, so ranges that begin together keep their
+/// order, as the comparison sort left them.
+fn ordered_by_first(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let n = ranges.len();
+    let mut passes = 1;
+    let mut max = 0;
+    for (from, _) in &ranges {
+        max = max.max(*from);
+    }
+    while max >> (8 * passes) > 0 {
+        passes += 1;
+    }
+    GONE.with(|gone| {
+        let mut dst = gone.borrow_mut();
+        dst.clear();
+        dst.resize(n, (0, 0));
+        for pass in 0..passes {
+            let shift = 8 * pass;
+            let mut at = [0usize; 256];
+            for (from, _) in &ranges {
+                at[(from >> shift) & 0xff] += 1;
+            }
+            let mut sum = 0;
+            for slot in &mut at {
+                (sum, *slot) = (sum + *slot, sum);
+            }
+            for &(from, to) in &ranges {
+                let bucket = (from >> shift) & 0xff;
+                dst[at[bucket]] = (from, to);
+                at[bucket] += 1;
+            }
+            std::mem::swap(&mut ranges, &mut dst);
+        }
+        // (The scratch keeps its room for the next plan's ranges.)
+        ranges
+    })
+}
+
+// The scratch of [`ordered_by_first`], one per thread.
+thread_local! {
+    static GONE: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether the order of many ranges is found by radix sort (on by default;
+/// `VICTORY_CARD_RADIX=0` restores the comparison sort; diagnostics' A/B can
+/// alternate it).
+fn radix_order_on() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_CARD_RADIX") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_RADIX").is_none_or(|v| v != "0"))
 }
 
 /// Bytes between two dirty runs allowed in their one card upload.
@@ -894,7 +975,7 @@ fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs, joined_within};
+    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_by, joined_piece_runs, joined_within, ordered_by_first};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -982,6 +1063,68 @@ mod card_tests {
             [(0, usize::MAX)]
         );
         assert_eq!(joined_within(vec![(0, 10), (75, 80)], 64), [(0, 10), (75, 80)]);
+    }
+
+    /// Short runs in no order, as several threads' page sweeps note them.
+    fn noted_runs(n: usize, span: usize, seed: u64) -> Vec<(usize, usize)> {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        (0..n)
+            .map(|_| {
+                let at = (next() as usize) % span.max(8);
+                let (from, len) = (at & !7, 8 * (1 + (next() as usize) % 8));
+                (from, from.saturating_add(len))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn many_ranges_are_ordered_as_the_comparison_sort_ordered_them() {
+        // (Sizes around the threshold, and spans of one to five radix passes.)
+        for &(n, span) in &[
+            (0usize, 4096usize),
+            (1, 64),
+            (255, 1 << 12),
+            (256, 1 << 12),
+            (1_000, 1 << 20),
+            (9_000, 64 << 20),
+            (9_000, 1 << 33),
+            (9_000, (1 << 20) - 8),
+        ] {
+            let runs = noted_runs(n, span, 0x5eed_1234_u64.wrapping_add(n as u64).wrapping_add(span as u64));
+            let ordered = ordered_by_first(runs.clone());
+            assert!(ordered.windows(2).all(|w| w[0].0 <= w[1].0), "n {n} span {span:#x}");
+            // (The comparison sort breaks ties by `to`, the radix sort keeps
+            // them in the order they came: the same ranges, once each.)
+            let mut each = ordered.clone();
+            each.sort_unstable();
+            let mut once = runs.clone();
+            once.sort_unstable();
+            assert_eq!(each, once, "n {n} span {span:#x}");
+            for &gap in &[0usize, 64] {
+                let by_comparison = joined_by(runs.clone(), gap, false);
+                // (The radix order gives the comparison sort's joined ranges.)
+                assert_eq!(joined_by(runs.clone(), gap, true), by_comparison, "radix n {n} span {span:#x} gap {gap}");
+            }
+        }
+    }
+
+    #[test]
+    fn ordering_many_ranges_keeps_every_range_once() {
+        let runs = noted_runs(2_000, 1 << 22, 0xa5a5_1234);
+        let ordered = ordered_by_first(runs.clone());
+        assert_eq!(ordered.len(), runs.len());
+        let mut a = ordered;
+        let mut b = runs;
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+        assert!(a.windows(2).all(|w| w[0].0 <= w[1].0));
     }
 }
 
