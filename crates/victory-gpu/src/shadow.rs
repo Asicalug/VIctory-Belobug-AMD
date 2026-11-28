@@ -2030,6 +2030,84 @@ fn back_piece(
     Some((first, n))
 }
 
+/// Scratch for one synchronous copy-back job. It is reused by its pieces;
+/// no allocation or title-memory range is shared between jobs.
+#[derive(Default)]
+struct BackScratch {
+    title: Vec<u8>,
+    mask: Vec<u8>,
+    runs: Vec<(usize, usize)>,
+}
+
+/// Runs `(copy, title address, bytes)` pieces through `merge`, whose first
+/// argument is the piece's original index. The serial order is the input
+/// order. The parallel order is [`crate::land::ordered`]'s: pieces sharing a
+/// 64 KiB title block stay in one job and in that same order, while different
+/// blocks may run at once.
+fn run_back_pieces(
+    pieces: &[crate::land::Piece],
+    parallel: bool,
+    merge: &(dyn Fn(usize, usize, usize, &mut BackScratch) + Sync),
+) {
+    if !parallel {
+        let mut scratch = BackScratch::default();
+        for (i, &(_, at, n)) in pieces.iter().enumerate() {
+            merge(i, at, n, &mut scratch);
+        }
+        return;
+    }
+    let ordered = crate::land::ordered(pieces);
+    let ranges: Vec<_> = ordered.iter().map(|&(_, at, n)| (at, n)).collect();
+    let jobs = crate::land::jobs(&ranges);
+    crate::land::each(jobs.len(), &|job| {
+        let mut scratch = BackScratch::default();
+        for &(i, at, n) in &ordered[jobs[job].clone()] {
+            merge(i, at, n, &mut scratch);
+        }
+    });
+}
+
+/// Merges the pieces [`find_all`] found in `work`, on independent title
+/// blocks in parallel, and returns the bytes written for each work item.
+/// [`Shadow::back_found`] supplies exactly [`Shadow::copy_back_with`]'s merge
+/// semantics; this does not use the relay's different three-way merge.
+pub(crate) fn copy_back_found(
+    work: &[(Arc<Shadow>, usize, usize)],
+    found: &[Vec<(usize, usize)>],
+) -> Vec<usize> {
+    for (shadow, address, end) in work {
+        if shadow.place.is_none() {
+            let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
+            shadow.compared(from, to);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let syncing = std::time::Instant::now();
+    let mut pieces = Vec::new();
+    for (which, ((shadow, _, _), differing)) in work.iter().zip(found).enumerate() {
+        if shadow.place.is_some() {
+            continue;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::BackDiffer, differing.len() as u64);
+        for &(at, n) in differing {
+            shadow.changed(at, at + n);
+            pieces.push((which as u64, shadow.start as usize + at, n));
+        }
+    }
+    let written: Vec<_> = (0..work.len()).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
+    run_back_pieces(&pieces, true, &|i, at, n, scratch| {
+        let which = pieces[i].0 as usize;
+        let shadow = &work[which].0;
+        let offset = at - shadow.start as usize;
+        let n = shadow.back_found(offset, n, scratch);
+        written[which].fetch_add(n, Ordering::Relaxed);
+    });
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+    written.iter().map(|n| n.load(Ordering::Relaxed)).collect()
+}
+
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -2451,7 +2529,7 @@ pub(crate) fn land_as_before(start: usize, now: usize, held: usize, n: usize, ti
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PAGE, PIECE, back_piece, changed_runs, dword_runs, put_changed, word_runs, word_runs_put};
+    use super::{PAGE, PIECE, BackScratch, back_piece, changed_runs, dword_runs, put_changed, run_back_pieces, word_runs, word_runs_put};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2703,6 +2781,84 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// Parallel copy-back is the serial merge with independent title blocks
+    /// distributed over jobs. Overlapping copies in one block retain their
+    /// input order, and an intervening title write still wins over the GPU.
+    #[test]
+    fn parallel_found_pieces_match_the_serial_merge() {
+        const BASE: usize = 0x1000_0000;
+        let mut specs = vec![(0usize, 256usize), (128, 256)];
+        specs.extend((1..=6).map(|block| (block * PIECE, PIECE)));
+        let original: Vec<u8> = (0..7 * PIECE).map(|i| (i * 31 + i / 257) as u8).collect();
+        let pieces: Vec<_> = specs
+            .iter()
+            .enumerate()
+            .map(|(which, &(at, n))| (which as u64, BASE + at, n))
+            .collect();
+        let run = |parallel: bool| {
+            let old: Vec<_> = specs.iter().map(|&(at, n)| original[at..at + n].to_vec()).collect();
+            let hosts: Vec<_> = old
+                .iter()
+                .enumerate()
+                .map(|(which, old)| {
+                    let mut host = old.clone();
+                    host[old.len() / 3] ^= 0x5a;
+                    if which == 0 {
+                        host[128] ^= 0x11;
+                        host[200] ^= 0x22;
+                    } else if which == 1 {
+                        host[0] ^= 0x44;
+                        host[72] ^= 0x55;
+                    }
+                    std::sync::Mutex::new(host)
+                })
+                .collect();
+            let mut initial = original.clone();
+            initial[200] ^= 0x77;
+            let title = std::sync::Mutex::new(initial);
+            let order = std::sync::Mutex::new(Vec::new());
+            run_back_pieces(&pieces, parallel, &|i, at, n, scratch| {
+                let which = pieces[i].0 as usize;
+                let offset = at - BASE - specs[which].0;
+                let mut host = hosts[which].lock().unwrap();
+                let mut title_memory = title.lock().unwrap();
+                let title_at = at - BASE;
+                let read = |first: usize, into: &mut [u8]| {
+                    into.copy_from_slice(&title_memory[title_at + first..title_at + first + into.len()]);
+                    true
+                };
+                let BackScratch { title: merged, mask, runs } = scratch;
+                let Some((first, _)) = back_piece(
+                    &mut host[offset..offset + n],
+                    &old[which][offset..offset + n],
+                    merged,
+                    mask,
+                    runs,
+                    read,
+                ) else {
+                    return;
+                };
+                for &(run, n) in runs.iter() {
+                    title_memory[title_at + first + run..title_at + first + run + n]
+                        .copy_from_slice(&merged[run..run + n]);
+                }
+                order.lock().unwrap().push(which);
+            });
+            let title = title.into_inner().unwrap();
+            let hosts: Vec<_> = hosts.into_iter().map(|host| host.into_inner().unwrap()).collect();
+            let order = order.into_inner().unwrap();
+            (title, hosts, order)
+        };
+        let serial = run(false);
+        let parallel = run(true);
+        assert_eq!(parallel.0, serial.0);
+        assert_eq!(parallel.1, serial.1);
+        assert_eq!(parallel.2.iter().copied().filter(|&which| which < 2).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(parallel.0[200], original[200] ^ 0x77, "the title's intervening write survives");
+        assert_eq!(parallel.0[128], original[128] ^ 0x11, "the first overlapping copy lands first");
+        assert_eq!(parallel.1[1][0], parallel.0[128], "the second copy takes that ordered result");
     }
 }
 
@@ -3525,6 +3681,43 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
+    }
+
+    /// One already-found piece of [`Shadow::copy_back_with`]. This is its
+    /// per-piece body, including the title-write guard and dword-only write,
+    /// with the read lock that lets independent pieces merge at once while
+    /// excluding [`Shadow::merge_under_writes`] and host refreshes.
+    fn back_found(&self, at: usize, n: usize, scratch: &mut BackScratch) -> usize {
+        if n == 0 || at + n > self.len as usize || self.place.is_some() {
+            return 0;
+        }
+        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = &*snapshot else {
+            return 0;
+        };
+        let start = self.start as usize;
+        // SAFETY: `find_all` cut this piece inside the copy and its snapshot;
+        // ordered jobs give each copy byte and title block to one job at a
+        // time, and the read lock excludes writers of the copy.
+        let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+        // Snapshot buffers are pooled and cleared: their Vec length is zero
+        // although their capacity covers the copy, and `writing` fills each
+        // declared range through the allocation's pointer.
+        // SAFETY: as above, `find_all` found this declared piece in that
+        // allocation. This is the same raw-slice basis as `copy_back_with`.
+        let old = unsafe { std::slice::from_raw_parts(before.as_ptr().add(at), n) };
+        let read = |first: usize, title: &mut [u8]| crate::host::read_into((start + at + first) as *const u8, title);
+        let BackScratch { title, mask, runs } = scratch;
+        let Some((first, n)) = back_piece(host, old, title, mask, runs, read) else {
+            return 0;
+        };
+        let was: Vec<u8> = title.iter().zip(mask.iter()).map(|(now, changed)| now ^ changed).collect();
+        if runs.is_empty() {
+            0
+        } else {
+            put_changed(start + at + first, &was[..n], &title[..n])
+        }
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -4985,6 +5178,55 @@ mod land_tests {
             crate::title_memory_remapped(at, len);
             crate::inplace::title_memory_view(at, len, section as usize, 0);
             at
+        }
+    }
+
+    /// A found piece uses the snapshot's allocated bytes, not its Vec length:
+    /// pooled snapshots are cleared to length zero while retaining the whole
+    /// copy's capacity. The parallel helper then matches the established
+    /// serial merge, including an intervening title write.
+    #[test]
+    fn found_merge_uses_a_zero_length_pooled_snapshot() {
+        const LEN: usize = PIECE;
+        let base: Vec<u8> = (0..LEN).map(|i| (i * 17 + i / 311) as u8).collect();
+        let make = |title: usize| {
+            let mut host = base.clone();
+            let shadow = Shadow::unbacked(title as u64, host.as_mut_ptr(), LEN as u64, false);
+            let mut before = Vec::with_capacity(LEN);
+            // SAFETY: the allocation holds LEN bytes; its length deliberately
+            // stays zero, as `pooled` leaves a snapshot for `writing` to fill.
+            unsafe { std::ptr::copy_nonoverlapping(base.as_ptr(), before.as_mut_ptr(), LEN) };
+            *shadow.before.lock().unwrap() = Some(before);
+            (shadow, host)
+        };
+        let (a, b) = (memory(LEN, false), memory(LEN, false));
+        assert!(a != 0 && b != 0);
+        let (one, mut one_host) = make(a);
+        let (many, mut many_host) = make(b);
+        for (title, host) in [(a, &mut one_host), (b, &mut many_host)] {
+            // SAFETY: both test allocations hold LEN bytes.
+            unsafe { std::ptr::copy_nonoverlapping(base.as_ptr(), title as *mut u8, LEN) };
+            for at in [5, 9, 40_000] {
+                host[at] ^= 0x33;
+            }
+            // The title wrote one byte the GPU did not, and one it did: both
+            // title writes must survive their respective merges.
+            for at in [7, 40_000] {
+                // SAFETY: in the title allocation.
+                unsafe { ((title + at) as *mut u8).write(base[at] ^ 0x66) };
+            }
+        }
+        assert_eq!(one.before.lock().unwrap().as_ref().unwrap().len(), 0);
+        assert_eq!(many.before.lock().unwrap().as_ref().unwrap().len(), 0);
+        let one_found = super::find_all(&[(one.clone(), a, a + LEN)]);
+        let many_found = super::find_all(&[(many.clone(), b, b + LEN)]);
+        let serial = one.copy_back_with(a, LEN, Some(one_found[0].clone()));
+        let parallel = super::copy_back_found(&[(many.clone(), b, b + LEN)], &many_found)[0];
+        assert_eq!(parallel, serial);
+        // SAFETY: both titles and host mappings still hold LEN bytes.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(b as *const u8, LEN), std::slice::from_raw_parts(a as *const u8, LEN));
+            assert_eq!(many_host, one_host);
         }
     }
 

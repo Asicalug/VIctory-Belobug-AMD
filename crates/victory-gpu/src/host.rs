@@ -4135,11 +4135,21 @@ fn hand_back(back: &[Declared]) {
         let found = crate::shadow::find_all(&work);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
-        for ((shadow, from, to), found) in work.iter().zip(found) {
-            let written = shadow.copy_back_with(*from, to - from, Some(found));
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
+        if crate::toggled!("VICTORY_BACK_PARALLEL") && found.iter().map(Vec::len).sum::<usize>() >= 8 {
+            let written = crate::shadow::copy_back_found(&work, &found);
+            for ((_shadow, from, to), written) in work.iter().zip(written) {
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(*from, to - from, written);
+                let _ = (from, to);
+            }
+        } else {
+            for ((shadow, from, to), found) in work.iter().zip(found) {
+                let written = shadow.copy_back_with(*from, to - from, Some(found));
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::compared(*from, to - from, written);
+            }
         }
         for (shadow, declared) in back {
             shadow.copy_back_done(declared);
