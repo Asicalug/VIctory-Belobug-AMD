@@ -40,17 +40,33 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
-pub(crate) fn room(memory: Option<[u64; 4]>) {
+/// A memory budget (`VICTORY_MEMORY_BUDGET_MIB`) overrules both: a sixteenth
+/// short of it only [`SPARE`] blocks stay, at or over it none, and they go at
+/// once rather than at the next allocation, since keeping to the budget is
+/// why it is set. Asked once a second.
+pub(crate) fn room(memory: Option<[u64; 4]>, footprint: Option<u64>) {
+    let budget = crate::residency::budget();
+    let limit =
+        crate::residency::spares_under(spares(memory, crate::host::keep_freed()), SPARE, footprint, budget);
     if !crate::residency::on() {
-        SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+        SPARES.store(limit, Ordering::Relaxed);
+        if budget.is_some() {
+            let tick = now();
+            if let Ok(mut pool) = TEXTURES.try_lock() {
+                pool.reclaim(tick, limit, true);
+            }
+            if let Ok(mut pool) = STAGING.try_lock() {
+                pool.reclaim(tick, limit.min(STAGING_KEPT), true);
+            }
+        }
         return;
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
     // not at the pool's next allocation.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let keep = crate::host::keep_freed() && !pressure;
+    let limit = crate::residency::spares_under(spares(memory, keep), SPARE, footprint, budget);
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     if let Ok(mut pool) = TEXTURES.try_lock() {

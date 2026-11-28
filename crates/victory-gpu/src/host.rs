@@ -559,7 +559,16 @@ fn sweep() {
     if crate::residency::pressured() {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    // Asked once for both: the card's own memory, the process's, and the two
+    // together as a budget counts them.
+    let card = host().and_then(|h| h.video_memory());
+    let ram = ram_sample().map(|sample| sample.0);
+    let footprint = match (ram, card) {
+        (Some(ram), Some(card)) => Some(ram.saturating_add(card[1])),
+        _ => None,
+    };
+    crate::pool::room(card, footprint);
+    crate::residency::report(ram, card);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();

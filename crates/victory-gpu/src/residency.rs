@@ -17,6 +17,60 @@ use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORY
 
 const MIB: u64 = 1 << 20;
 
+/// `VICTORY_MEMORY_BUDGET_MIB`: the most the process's memory in physical
+/// memory and the card's own may come to together (unset or 0: no budget, and
+/// blocks are kept by the card's room alone). What can be let go to keep to it
+/// is what nothing uses: empty blocks of textures and of staging buffers; a
+/// texture or a list still holding a piece keeps it.
+pub(crate) fn budget() -> Option<u64> {
+    static BUDGET: OnceLock<Option<u64>> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let mib = std::env::var("VICTORY_MEMORY_BUDGET_MIB").ok()?.trim().parse::<u64>().ok()?;
+        (mib > 0).then(|| mib.saturating_mul(MIB))
+    })
+}
+
+/// Empty blocks to keep while `footprint` (the process's memory in physical
+/// memory plus the card's own) is under `budget`: `base` below a sixteenth of
+/// it, `spare` from there, none at it. (Run `210714-12456`: 92 blocks of
+/// textures, 5,888 MB, held while the process and the card came to about
+/// 28 GiB. The title's own memory and the textures it draws cannot be let go,
+/// so the empty blocks are what a budget reaches first.)
+pub(crate) fn spares_under(
+    base: usize,
+    spare: usize,
+    footprint: Option<u64>,
+    budget: Option<u64>,
+) -> usize {
+    match (footprint, budget) {
+        (Some(footprint), Some(budget)) if footprint >= budget => 0,
+        (Some(footprint), Some(budget)) if footprint >= budget - budget / 16 => spare.min(base),
+        _ => base,
+    }
+}
+
+/// Says where the combined footprint stands against the budget once every ten
+/// seconds: the process's memory in physical memory, the card's own in use,
+/// and the two together against the budget.
+pub(crate) fn report(ram: Option<u64>, card: Option<[u64; 4]>) {
+    let Some(budget) = budget() else { return };
+    let (Some(ram), Some(card)) = (ram, card) else { return };
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if !CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(10) {
+        return;
+    }
+    let combined = ram.saturating_add(card[1]);
+    tracing::info!(
+        ram_mib = ram >> 20,
+        card_mib = card[1] >> 20,
+        card_shared_mib = card[3] >> 20,
+        combined_mib = combined >> 20,
+        budget_mib = budget >> 20,
+        over_budget_mib = combined.saturating_sub(budget) >> 20,
+        "combined footprint: the process's memory in physical memory and the card's own in use"
+    );
+}
+
 /// `VICTORY_RESIDENCY=1`: the memory budgets of this module (off by default).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -222,6 +276,23 @@ mod tests {
             assert_eq!(has_upload_reserve(commit, false, false), lookahead);
             assert_eq!(has_growth_reserve(commit, false, false), growth);
         }
+    }
+
+    #[test]
+    fn a_budget_lets_go_of_empty_blocks_before_it_is_passed() {
+        // No budget, or no footprint yet: as before.
+        assert_eq!(spares_under(64, 2, None, None), 64);
+        assert_eq!(spares_under(64, 2, Some(20 * GIB), None), 64);
+        assert_eq!(spares_under(64, 2, None, Some(16 * GIB)), 64);
+        // Well inside it: kept, so the next scene's textures are not new.
+        assert_eq!(spares_under(64, 2, Some(8 * GIB), Some(16 * GIB)), 64);
+        assert_eq!(spares_under(64, 2, Some(14 * GIB), Some(16 * GIB)), 64);
+        // Within a sixteenth of it, and at or over it: let go.
+        assert_eq!(spares_under(64, 2, Some(15 * GIB), Some(16 * GIB)), 2);
+        assert_eq!(spares_under(64, 2, Some(16 * GIB), Some(16 * GIB)), 0);
+        assert_eq!(spares_under(64, 2, Some(19 * GIB), Some(16 * GIB)), 0);
+        // A base below the spare is never raised by the budget.
+        assert_eq!(spares_under(1, 2, Some(15 * GIB), Some(16 * GIB)), 1);
     }
 
     #[test]
