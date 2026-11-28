@@ -1941,6 +1941,17 @@ fn timing() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_TIMING"))
 }
 
+/// `VICTORY_GPU_TIMING=batch`: the commands are timed as in a timing run, but
+/// every list of a submission runs in one call, as it does without timing, so
+/// the card's time is the one of an ordinary frame. What a list's own start
+/// costs (its sending) is then not in any command, which is why the batch's
+/// wall time is reported beside the commands' sum.
+#[cfg(feature = "diagnostics")]
+fn timing_batch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| timing() && std::env::var_os("VICTORY_GPU_TIMING").is_some_and(|v| v == "batch"))
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on), or for
 /// the frame recorder (`VICTORY_RECORD`).
@@ -6105,7 +6116,7 @@ impl Host {
         // (Each list on its own: a run's prelude, which brings its copies up
         // to date, apart from the run's commands; the compare apart from the
         // last run.)
-        let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if timing() {
+        let groups: Vec<(&[Option<ID3D12CommandList>], crate::copystat::Timed)> = if timing() && !timing_batch() {
             marks
                 .iter()
                 .zip(marks.iter().skip(1).map(|m| m.0).chain([lists.len()]))
@@ -6151,16 +6162,29 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             if timing() {
                 let wall = started.elapsed().as_micros() as u64;
-                let mut noted = 0.0;
-                if let crate::copystat::Timed::Title(run) = _kind {
-                    // SAFETY: a plain query.
-                    let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                    for (ms, op) in runs[run].slowest(frequency, usize::MAX) {
-                        crate::copystat::command_took(&op, ms);
-                        noted += ms;
+                // SAFETY: a plain query.
+                let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
+                if timing_batch() {
+                    // Every list of the submission ran together: each one's
+                    // commands are read back now, their notes already made.
+                    let mut noted = 0.0;
+                    for run in runs.iter() {
+                        for (ms, op) in run.slowest(frequency, usize::MAX) {
+                            crate::copystat::command_took(&op, ms);
+                            noted += ms;
+                        }
                     }
+                    crate::copystat::batch_took(wall, (noted * 1e3) as u64);
+                } else {
+                    let mut noted = 0.0;
+                    if let crate::copystat::Timed::Title(run) = _kind {
+                        for (ms, op) in runs[run].slowest(frequency, usize::MAX) {
+                            crate::copystat::command_took(&op, ms);
+                            noted += ms;
+                        }
+                    }
+                    crate::copystat::list_took(_kind, wall, (noted * 1e3) as u64);
                 }
-                crate::copystat::list_took(_kind, wall, (noted * 1e3) as u64);
             }
             // A submission of one list was never named here (`groups.len()
             // > 1` was the test): the two 50 ms lists of the gameplay

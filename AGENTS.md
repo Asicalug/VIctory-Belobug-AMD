@@ -11,10 +11,55 @@ handling, landing semantics, and no-lost-write coverage.
 Use bounded, repeatable opening/heavy-scene/transition benchmarks. Review, test,
 commit and push validated work. Open a PR to `Belobug/VIctory-Belobug-AMD`
 **only after acceptance evidence is met**, then address available review
-comments. No PR is justified now: heavy scenes remain well above 33.3 ms/frame.
+comments. No PR is justified now: heavy scenes remain well above 33.3 ms/frame,
+and the measured ceiling at full quality is about 14 to 16 fps.
 
-Earlier tasks t1–t21 are complete. Ordered parallel card-copy merging is now
-retained and validated; native heavy-scene acceptance remains unmet.
+Earlier tasks t1–t21 are complete. Ordered parallel card-copy merging,
+synchronous direct uploads and asynchronous submission (stage 3) are retained
+and validated. Native heavy 3D is now 71 to 79 ms/frame, from 135.6 ms.
+Acceptance still fails: the title's own ray-traced compute is 45 to 50 ms of
+GPU time a frame, so 33.3 ms is below that floor.
+
+## Asynchronous submission decision
+
+The RX preset now selects `VICTORY_LATE_WAIT=3` instead of pinning 0. A
+submission is prepared and sent, and waited for only where a later one reads
+what it writes, so preparing overlaps the card. With flights in the air the
+by-address arenas (`memory.rs`) take a shared CPU/GPU buffer instead of title
+memory in place; that moved 1.3 to 1.7 GB from the process's physical memory to
+the card's own use and did not raise the combined footprint (peak 34,838 against
+34,545 MiB synchronous).
+
+Measured at the complete native-quality preset, 180-second bounded diagnostics
+runs with no screenshots and no leftover process: synchronous `135126-12400`
+reached 155.6/160.4 ms at 4,991 draws/frame with a 991.7 ms worst world frame;
+asynchronous `135518-13644` reached 69.8/74.1 ms at 4,728 draws with 958.7 ms.
+The closest matched pair is 5,015 draws at 155.6 ms against 5,014 draws at
+74.2 ms (`134146-9484`), a factor of 2.1. The asynchronous frame's columns no
+longer sum to its frame time (39.2 + 32.0 + 24.5 = 95.7 ms into 74.2 ms), which
+is the overlap; the synchronous ones do (45.1 + 71.3 + 32.4 = 148.8 into 155.6).
+
+Default release `140150-10520` (preset only, no overrides) ended at 12.7 to
+14.1 fps, 71.1 to 78.6 ms at 4,685 to 4,912 draws, worst world frame 517.1 ms,
+against the previous synchronous release baseline of 7.4/7.2 fps at 135.6/138.4
+ms and a 1,114.1 ms transition. No panic, device removal or out-of-memory report
+in any run; `-More @{ VICTORY_LATE_WAIT = '0' }` restores the synchronous path.
+
+Diagnostics gained `VICTORY_GPU_TIMING=batch`: every list of a submission runs
+in one call as an ordinary frame sends them, and each list's stamps are read
+back after the signal, so the card's time is an ordinary frame's. It reported
+67.3 ms of card wall a frame at 31 submissions, of which 48 to 52 ms is the
+title's own draw and dispatch commands and 1.8 ms the layer's alias copies. The
+per-list form (`VICTORY_GPU_TIMING=1`) inflates the wall to 98 ms and leaves the
+title's command sum at 58.6 ms; that is what separates the two modes.
+
+Where a synchronous heavy frame spends its time (`133659-2804`, 172.9 ms in that
+instrumented build): 47.2 ms preparing, of which 24.1 ms refreshes (19,442
+ranges a frame, 18,337 knowing they copy nothing, 9.2 GB compared to find 236 MB
+changed), 6.7 ms snapshots and 3.6 ms card-memory copies; 85.8 ms on the card;
+33.2 ms copying back about 464 MB of shader writes. `copy_mapped` already runs
+the fault-tolerant `rep movsb` of `safecopy`, so its 47.9 ms a frame is the bytes
+and not the calls.
 
 ## Exact handoff state
 
@@ -29,8 +74,24 @@ retained and validated; native heavy-scene acceptance remains unmet.
   not the older, divergent `origin/main`.
 - Last pull of `origin/a-publier`: `Already up to date`; all its commits were
   already integrated.
-- Latest retained code baseline: `17ed48c` (synchronous direct uploads).
-  All committed work through `17ed48c` is pushed to the fork.
+- Latest retained code baseline: the asynchronous-submission commit on top of
+  `36a2813`; all committed work is pushed to the fork.
+- Latest default-release acceptance log:
+  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261128-140150-10520.log`
+  (preset only, no overrides): 12.7 to 14.1 fps, 71.1 to 78.6 ms at 4,685 to
+  4,912 draws, worst world frame 517.1 ms. The previous synchronous baseline is
+  `play-20261127-222102-12860.log` at 7.4/7.2 fps, 135.6/138.4 ms.
+- Latest 3D profiling logs of 2026-11-28: synchronous frame split
+  `133659-2804` (budget set), synchronous footprint `135126-12400`, batched
+  per-command card timings `133203-23248`, per-list card timings `132540-17544`,
+  and asynchronous runs `134146-9484`, `134542-3720`, `135518-13644`.
+- `target/gpu-attribution-run.ps1` runs one bounded native benchmark with a
+  chosen `-More`, the reference key sequence and the window kept in front, then
+  reaps any leftover benchmark process.
+- The 3D frame at the old synchronous baseline was a serial sum: 42.5 ms
+  preparing (22.1 ms copies), 59.8 ms on the GPU, 32.5 ms copying back, about
+  134.8 ms of a 135.6 ms frame. Asynchronous submission now overlaps preparing
+  and copy-back with the card, which is the retained win.
 - The t21 source experiment has been reverted; no t21 source modifications
   remain in `crates/victory-gpu/src/land.rs` or `land/tests.rs`.
 - The rejection and native A/B evidence are recorded in `docs/rx-9070-xt.md`.
@@ -45,8 +106,10 @@ retained and validated; native heavy-scene acceptance remains unmet.
   nothing measurable. See `docs/rx-9070-xt.md`, "The budget path measured at full
   quality": the 16 GiB target and the 20 GiB ceiling are about 12.4 GiB away at
   full quality, so they stay unmet.
-- Latest default-release acceptance log:
-  `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-222102-12860.log`.
+- Latest default-release acceptance log (superseded):
+  `play-20261127-222102-12860.log` held 7.4/7.2 fps at 135.6/138.4 ms with a
+  1,114.1 ms transition. See `play-20261128-140150-10520.log` for the current
+  default.
 - Latest diagnostics refresh profile:
   `C:\Users\FlowUp\AppData\Local\victory\logs\play-20261127-223906-8840.log`;
   latest rejected sparse-planning A/B: `play-20261127-225604-23816.log`.
@@ -55,8 +118,9 @@ retained and validated; native heavy-scene acceptance remains unmet.
   `play-20261127-214230-9640.log`, and the memory census remains
   `play-20261127-210714-12456.log`.
 - The default-release run held 30 fps in the opening/menu, but heavy 3D did not
-  meet acceptance. Final samples were 7.4/7.2 fps at 135.6/138.4 ms with about
-  5,000 draws; a heavy transition reached 1,114.1 ms. No PR is justified.
+  meet acceptance: 7.4/7.2 fps at 135.6/138.4 ms with about 5,000 draws and a
+  1,114.1 ms heavy transition. The asynchronous preset now reaches 71 to 79 ms
+  in heavy 3D, still above 33.3 ms. No PR is justified.
 - It had no panic, device removal, out-of-memory report or fatal runtime error.
   Launcher exit `-1` was the intended benchmark timeout killing the title, not
   a title crash. Explicit cleanup confirmed zero benchmark processes.
@@ -291,12 +355,14 @@ The `-Rx9070` launcher preset selects:
   `f16876929fa64f9f`. The skip works around an AMD compiler crash and can affect
   skinned animation velocity; do not silently remove or broaden it.
 - Residency/memory limits and 256 KiB host-window tracking.
-- Normal `VICTORY_LATE_WAIT=0` for synchronized in-place RT arenas.
+- `VICTORY_LATE_WAIT=3` (asynchronous submission) since 2026-11-28: the by-address
+  arenas then take a shared CPU/GPU buffer instead of title memory in place.
+  `-More @{ VICTORY_LATE_WAIT = '0' }` restores the synchronous path.
 
 `-Performance` enables renderer ports 1, 2, 5, 6 and 7 and a 33.333 ms frame
-interval. Experiments commonly override `VICTORY_LATE_WAIT=3` and
-`VICTORY_CARD_BUFFERS_MIN_MB=1`; these are experiment settings, not silent
-changes to the normal preset.
+interval. `VICTORY_CARD_BUFFERS_MIN_MB=1` remains an experiment setting: with it
+one asynchronous run reached only 405.7 ms in its worst world frame but another
+spiked to 4,424 ms, while the preset's own default reached 958.7 ms.
 
 Game executable used by existing logs:
 

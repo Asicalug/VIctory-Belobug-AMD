@@ -260,6 +260,22 @@ pub(crate) fn list_took(kind: Timed, wall: u64, noted: u64) {
     t.1 = t.1.min(wall);
 }
 
+/// With `VICTORY_GPU_TIMING=batch`, per submission: how many submissions, the
+/// microseconds from sending one to the card's signal, and the microseconds of
+/// the commands noted in it. Timed with every list in one call, as an ordinary
+/// frame sends them, so the card's time is the one of an ordinary frame and not
+/// of a run that waits for each list.
+static BATCH_TIMED: Mutex<[u64; 3]> = Mutex::new([0; 3]);
+
+/// A submission took `wall` microseconds from its sending to the card's
+/// signal, `noted` of them in the commands it noted (batched timing run).
+pub(crate) fn batch_took(wall: u64, noted: u64) {
+    let mut t = BATCH_TIMED.lock().unwrap_or_else(|e| e.into_inner());
+    t[0] += 1;
+    t[1] += wall;
+    t[2] += noted;
+}
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
@@ -1466,6 +1482,21 @@ pub(crate) fn log(frames: f64) {
         );
     }
     let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
+    // The batched timing's own line first: the card's time of an ordinary
+    // frame, its lists sent together, against what their commands account for.
+    let batched = std::mem::replace(&mut *BATCH_TIMED.lock().unwrap_or_else(|e| e.into_inner()), [0; 3]);
+    if batched[0] > 0 {
+        tracing::info!(
+            "  the card's time by submission (batched timing run), per frame: {:.1} ms in {:.1} submissions, of which \
+             {:.1} ms in the commands noted there and {:.1} ms in the lists' own sending, barriers and steps; {:.1} ms of \
+             it per submission",
+            batched[1] as f64 / 1e3 / frames,
+            batched[0] as f64 / frames,
+            batched[2] as f64 / 1e3 / frames,
+            (batched[1].saturating_sub(batched[2])) as f64 / 1e3 / frames,
+            batched[1] as f64 / 1e3 / batched[0].max(1) as f64
+        );
+    }
     let mut by: Vec<_> = by.into_iter().flatten().collect();
     by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
     // All of them together, and by their first word: the forty lines below
