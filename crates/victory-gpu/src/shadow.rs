@@ -5893,6 +5893,40 @@ fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> 
         .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
 
+/// The most bytes a window that holds another range's ask may have
+/// ([`shares`]): a big window holds more title memory and is refreshed over
+/// the whole of it.
+const SHARE_MOST: u64 = 16 << 20;
+
+/// How many windows below an ask are looked at for one that holds it.
+const SHARE_LOOK: usize = 256;
+
+/// Of the windows alive, the smallest that holds `[address, end)` and is no
+/// bigger than [`SHARE_MOST`]: what a window of another range would have been
+/// a second copy of. The memory line counts these and what they would have
+/// added; binding them instead was measured and did not move the footprint
+/// (a window already alive that holds part of a new range was made before it,
+/// and is still held by the slot that bound it, so it cannot go; see
+/// `docs/rx-9070-xt.md`, "Sharing a window was measured")
+fn shares<T>(map: &BTreeMap<(u64, u64), T>, address: u64, end: u64) -> Option<&T> {
+    map.range(..=(address, u64::MAX))
+        .rev()
+        .take(SHARE_LOOK)
+        .filter(|&(&(start, bytes), _)| start + bytes >= end && bytes <= SHARE_MOST)
+        .min_by_key(|&(&(_, bytes), _)| bytes)
+        .map(|(_, window)| window)
+}
+
+/// Windows made since the start, their bytes, and the bytes of those that a
+/// window already alive held (the same title memory in two windows).
+static WINDOW_MADE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`WINDOW_MADE`], and what windows hold now (`VICTORY_MEMORY_CATEGORIES`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_made() -> [u64; 3] {
+    [0, 1, 2].map(|i| WINDOW_MADE[i].load(Ordering::Relaxed))
+}
+
 /// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
 /// tails): only then is there more than one window to choose from.
 fn fine() -> bool {
@@ -6111,6 +6145,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
+    WINDOW_MADE[0].fetch_add(1, Ordering::Relaxed);
+    WINDOW_MADE[1].fetch_add(len, Ordering::Relaxed);
+    if shares(&map, address, end).is_some() {
+        // The same title memory is in a window already alive: what another
+        // copy of this range adds to the windows alive.
+        WINDOW_MADE[2].fetch_add(len, Ordering::Relaxed);
+    }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
@@ -6235,8 +6276,31 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, window_victims,
+        shares, tail_of, window_of, window_victims,
     };
+
+    /// A share takes the smallest window alive that holds the ask, never one
+    /// that begins above it and never one bigger than `SHARE_MOST`.
+    #[test]
+    fn a_share_is_the_smallest_window_that_holds_the_ask() {
+        const M: u64 = 1 << 20;
+        const C: u64 = 0x10_0000_0000;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert((C, 4 * M), 'a');
+        // The same memory once more, in a longer window: the duplication the
+        // memory line counts.
+        map.insert((C, 8 * M), 'b');
+        // Held, but too big to take for someone else's range.
+        map.insert((C - 8 * M, 32 * M), 'c');
+        assert_eq!(shares(&map, C + M, C + 2 * M), Some(&'a'));
+        assert_eq!(shares(&map, C + 7 * M, C + 8 * M), Some(&'b'));
+        // A window that begins above the ask never serves it, and a range
+        // that runs past every window has none.
+        assert_eq!(shares(&map, C + 32 * M, C + 33 * M), None);
+        assert_eq!(shares(&map, C + 7 * M, C + 9 * M), None);
+        // Too big to share, though it holds the ask.
+        assert_eq!(shares(&map, C - 4 * M, C - 3 * M), None);
+    }
 
     #[test]
     fn window_budget_evicts_oldest_only_until_it_fits() {

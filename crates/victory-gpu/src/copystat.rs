@@ -1044,13 +1044,19 @@ fn log_memory() {
     // Round 3: whether windows hold the same memory more than once (they
     // can, once they are cut finer than 4 MiB), and how many host lists
     // the title made and never used.
+    let windows_made = crate::shadow::window_made();
     tracing::info!(
         "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
          memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}",
+         reset since they were made: {}; windows made since the start: {}, {:.0} MB, of them {:.0} \
+         MB over title memory a window already alive held (the same bytes twice; binding that \
+         window instead was measured and did not move the footprint, docs/rx-9070-xt.md)",
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+        windows_made[0],
+        mb(windows_made[1]),
+        mb(windows_made[2]),
     );
     crate::book::memory();
     if memory_categories() {
