@@ -28,7 +28,20 @@ what it writes, so preparing overlaps the card. With flights in the air the
 by-address arenas (`memory.rs`) take a shared CPU/GPU buffer instead of title
 memory in place; that moved 1.3 to 1.7 GB from the process's physical memory to
 the card's own use and did not raise the combined footprint (peak 34,838 against
-34,545 MiB synchronous).
+34,545 MiB synchronous). Private commit is larger, but not all of that is the
+arenas: the asynchronous run had also streamed further (51,528 title textures
+with no host copy yet against 42,878), and those pages are mapped and mostly
+not resident.
+
+Two candidate follow-ups are already ruled out by measurement. Keeping the
+arenas in place under late needs the builder's page recycling to respect
+in-flight use as well as the writes to be declared, which is a larger project
+than the payoff: the footprint is not worse under asynchronous submission, so
+there is little to reclaim. Pruning the refresh compare is exhausted by the
+rejected range-covered sparse planner: the asynchronous run compares 20,167.6 MB
+a frame to find 111 MB that differs, only landed pages are noted page by page,
+and the compare already runs at about 415 GB/s across the workers, so the title
+is the one rewriting nearly every page of those ranges.
 
 Measured at the complete native-quality preset, 180-second bounded diagnostics
 runs with no screenshots and no leftover process: synchronous `135126-12400`
@@ -60,6 +73,11 @@ changed), 6.7 ms snapshots and 3.6 ms card-memory copies; 85.8 ms on the card;
 33.2 ms copying back about 464 MB of shader writes. `copy_mapped` already runs
 the fault-tolerant `rep movsb` of `safecopy`, so its 47.9 ms a frame is the bytes
 and not the calls.
+
+Under asynchronous submission the frame is 69.8 to 74.1 ms against a card wall
+of 60 to 71 ms, so the layer now adds about 10 ms rather than the 55% it added
+when synchronous. The next affordable targets are the 6.8 to 7.0 ms of snapshots
+and the 8.1 to 9.2 ms of copies in the card's memory.
 
 ## Exact handoff state
 
